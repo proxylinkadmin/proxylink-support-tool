@@ -2,6 +2,8 @@
 
 The one-time remote-support connector for [ProxyLink](https://proxylink.dev).
 
+Maintained by **Filippos Iliadis** (ProxyLink), Thessaloniki, Greece.
+
 A technician creates a support session in ProxyLink and sends the customer a short code.
 The customer runs this tool, enters the code, and the technician gets a browser-based view
 of their screen — for exactly as long as the session lasts, and no longer.
