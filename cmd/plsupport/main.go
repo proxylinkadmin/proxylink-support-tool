@@ -50,6 +50,9 @@ const (
 	tunnelName         = "plsupport"
 	uvncService        = "uvnc_service"
 	firewallRuleName   = "ProxyLink VNC"
+	// Written the moment a session starts changing the machine, deleted when cleanup
+	// finishes. Its presence at startup means a previous run never cleaned up.
+	statePath = `C:\Windows\Temp\plsupport.state`
 )
 
 // UltraVNC install locations to probe (uvnc-bvba installer).
@@ -157,7 +160,26 @@ func runGUI() {
 		}()
 	})
 
-	if preCode != "" {
+	// Finish any session that died without cleaning up (see recoverPreviousSession). It
+	// can take a few seconds — an UltraVNC uninstall is involved — so it runs off the UI
+	// thread with Connect disabled, rather than freezing the window on launch. The common
+	// case is that there is nothing to do and this is over instantly.
+	if fileExists(statePath) {
+		connectBtn.SetEnabled(false)
+		setStatus("Finishing an interrupted session...", "The last support session did not close properly. Putting this PC back as it was.")
+		go func() {
+			recoverPreviousSession()
+			mw.Synchronize(func() {
+				connectBtn.SetEnabled(true)
+				setStatus("", "You can close this window at any time to end support.")
+				if preCode != "" {
+					connectBtn.SetFocus()
+				} else {
+					codeEdit.SetFocus()
+				}
+			})
+		}()
+	} else if preCode != "" {
 		connectBtn.SetFocus()
 	} else {
 		codeEdit.SetFocus()
@@ -211,6 +233,9 @@ func fail(msg string) {
 func runFlow(s *appState) {
 	s.vncWasInstalled = uvncInstalled()
 	s.wgWasInstalled = fileExists(wireguardPath)
+	// Record what we found BEFORE changing anything, so a run that never reaches cleanup
+	// can still be undone correctly by the next launch. See recoverPreviousSession.
+	writeState(s)
 
 	setStatus("Generating secure keys...", "")
 	privKey, pubKey, err := generateWireGuardKeypair()
@@ -258,7 +283,7 @@ func runFlow(s *appState) {
 		return
 	}
 	s.vncInstalled = true
-	addVncFirewallRule()
+	addVncFirewallRule(s)
 
 	setStatus("Notifying your technician...", "")
 	if err := apiReady(s.server, s.code); err != nil {
@@ -430,12 +455,20 @@ func uninstallUltraVncSilently() {
 	os.Remove(vncSetupPath)
 }
 
-func addVncFirewallRule() {
-	// The UltraVNC installer can add its own broad 5900 rule (all profiles, any remote IP),
-	// which would expose the screen to the customer's local LAN — not just our VPN. Remove any
-	// VNC rule that isn't ours, then add our single rule scoped to the WireGuard range so 5900
-	// is reachable ONLY through the tunnel.
-	runPowerShell(`Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { ($_.DisplayName -match 'VNC|winvnc|uvnc') -and ($_.DisplayName -ne 'ProxyLink VNC') } | Remove-NetFirewallRule -ErrorAction SilentlyContinue`)
+func addVncFirewallRule(s *appState) {
+	// ⚠️ Only sweep when WE installed UltraVNC. Its installer adds its own broad 5900 rule
+	// (all profiles, any remote IP) which would expose the screen to the whole LAN rather
+	// than just our VPN, and that rule is ours to clean up because we caused it.
+	//
+	// When the VNC server was ALREADY here, its firewall rules are the customer's own and
+	// we leave them completely alone. Their exposure is their decision and it was exactly
+	// this wide before we arrived — adding a VPN-scoped rule alongside widens nothing.
+	// Deleting theirs used to be permanent: cleanup only ever removed OUR rule, so their
+	// own VNC access stayed broken after every support session, with nothing recorded
+	// anywhere to put it back. Same rule the Windows deploy follows.
+	if !s.vncWasInstalled {
+		runPowerShell(`Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { ($_.DisplayName -match 'VNC|winvnc|uvnc') -and ($_.DisplayName -ne 'ProxyLink VNC') } | Remove-NetFirewallRule -ErrorAction SilentlyContinue`)
+	}
 	runHidden(`C:\Windows\System32\netsh.exe`, "advfirewall", "firewall", "delete", "rule", "name="+firewallRuleName)
 	runHidden(`C:\Windows\System32\netsh.exe`, "advfirewall", "firewall", "add", "rule",
 		"name="+firewallRuleName, "protocol=TCP", "dir=in", "localport=5900",
@@ -468,6 +501,65 @@ func cleanup(s *appState) {
 		time.Sleep(1 * time.Second)
 		os.Remove(confPath)
 	}
+
+	// Last, so that a crash anywhere above leaves the marker behind and the next launch
+	// finishes the job.
+	os.Remove(statePath)
+}
+
+// ── recovery ─────────────────────────────────────────────────────────────────────
+
+// writeState records, before we touch anything, whether UltraVNC was already on this
+// machine. One byte, but it is the difference between a recovery that puts the customer's
+// own VNC server back and one that deletes it.
+func writeState(s *appState) {
+	v := "0"
+	if s.vncWasInstalled {
+		v = "1"
+	}
+	os.WriteFile(statePath, []byte(v), 0600)
+}
+
+// recoverPreviousSession undoes a session that never cleaned up after itself.
+//
+// ⚠️ Cleanup only ran when the window was closed. End Task, a crash, a power cut or a
+// client simply shutting the lid and rebooting left the machine with OUR session password
+// in their ultravnc.ini, our WireGuard tunnel service installed, and — before the fix
+// above — their own VNC firewall rules deleted. Nothing ever put any of it back, and the
+// client had no way to know. The .plbak files and this marker are the evidence needed to
+// finish the job on the next launch, so the tool repairs itself instead of leaving damage
+// behind on a stranger's PC.
+//
+// Best-effort and silent: if there is nothing to recover it does nothing at all.
+func recoverPreviousSession() {
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		return // no interrupted session
+	}
+	preexisting := strings.TrimSpace(string(raw)) == "1"
+
+	// If the dead session installed UltraVNC itself, our downloaded installer is still
+	// sitting in Temp — cleanup deletes it, so its presence is proof. Without that proof we
+	// do not run an uninstaller: between the two launches the client may have installed
+	// UltraVNC themselves, and removing software we cannot show we put there is the exact
+	// mistake this whole change is about.
+	if !preexisting && !fileExists(vncSetupPath) {
+		preexisting = true
+	}
+
+	prev := &appState{
+		server:          defaultServer,
+		vncWasInstalled: preexisting,
+		vncInstalled:    true,
+		wgTunnelUp:      true,
+	}
+	// Deliberately reuses the normal teardown: one definition of "undo", so a fix to the
+	// live path can never drift away from the recovery path.
+	removeUltraVnc(prev)
+	removeVncFirewallRule()
+	runHidden(wireguardPath, "/uninstalltunnelservice", tunnelName)
+	os.Remove(confPath)
+	os.Remove(statePath)
 }
 
 // forceCleanup is the manual recovery path (-cleanup CODE): it cuts remote access by stopping
