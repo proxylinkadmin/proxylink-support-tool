@@ -5,9 +5,9 @@
 # no private window in which to notice and no way to un-publish it: it is in the object
 # history, in every clone, and in GitHub's forks/events API within seconds.
 #
-# The app repo (/var/www/skipdns) has carried this guard for a while. This repo did not,
-# which is backwards — it is the one that gets pushed casually because "it is only the
-# client", and it is the one where a slip is irreversible.
+# Our main application repo has carried this guard for a while. This repo did not, which
+# is backwards — it is the one that gets pushed casually because "it is only the client",
+# and it is the one where a slip is irreversible.
 #
 # This catches ONE class of accident: a recognisable credential shape in staged content.
 # It is a seatbelt, not a security system. It cannot catch a secret in a format it does
