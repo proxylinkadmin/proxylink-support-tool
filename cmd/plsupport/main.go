@@ -55,7 +55,6 @@ var logoPNG []byte
 
 const (
 	defaultServer      = "https://app.proxylink.dev"
-	serverDomainSuffix = ".proxylink.dev"
 	wireguardPath      = `C:\Program Files\WireGuard\wireguard.exe`
 	wireguardInstaller = "https://download.wireguard.com/windows-client/wireguard-installer.exe"
 	ultravncInstaller  = "https://app.proxylink.dev/assets/ultravnc-setup.exe"
@@ -93,6 +92,10 @@ const (
 var (
 	vncSetupPath = filepath.Join(workDir, "uvnc-setup.exe")
 	confPath     = filepath.Join(workDir, tunnelName+".conf")
+	// The list of firewall rules that existed BEFORE we ran the UltraVNC installer. See
+	// addVncFirewallRule: a rule that appeared while we were installing is ours to remove,
+	// and a rule that was already there is the customer's, whatever it is called.
+	fwSnapshotPath = filepath.Join(workDir, "firewall-before.txt")
 	// Written the moment a session starts changing the machine, deleted when cleanup
 	// finishes. Its presence at startup means a previous run never cleaned up.
 	statePath = filepath.Join(workDir, "session.json")
@@ -148,7 +151,9 @@ type appState struct {
 	vncTouched bool // we have begun installing/configuring VNC this run
 	wgTouched  bool // we have begun installing/configuring the tunnel this run
 
-	expiresAt time.Time
+	// How much longer the session may run, measured from registration. A DURATION, never an
+	// absolute time: see sessionLifeFrom.
+	sessionLife time.Duration
 
 	cleaning  bool
 	cleanedUp bool
@@ -272,6 +277,14 @@ func runGUI() {
 		}
 
 		*canceled = true
+		// ⚠️ Take the controls away for good. After a failed attempt fail() re-enables them,
+		// and a customer who then closes the window can still click Connect while teardown is
+		// running: a second runFlow would reinstall UltraVNC and rewrite the ini while cleanup
+		// removes them, and its WaitGroup.Add would race cleanup's Wait, which Go documents as
+		// misuse and which can panic the process mid-teardown — the exact failure this whole
+		// change exists to prevent.
+		codeEdit.SetEnabled(false)
+		connectBtn.SetEnabled(false)
 		setStatus("Ending session — cleaning up...", "Removing screen sharing and the secure tunnel. This takes a few seconds.")
 		go func() {
 			cleanup(st)
@@ -286,7 +299,13 @@ func runGUI() {
 	// can take a few seconds — an UltraVNC uninstall is involved — so it runs off the UI
 	// thread with Connect disabled, rather than freezing the window on launch. The common
 	// case is that there is nothing to do and this is over instantly.
-	if fileExists(statePath) || fileExists(legacyStatePath) {
+	//
+	// ⚠️ Only when elevated. Every step of it — icacls, net stop, the uninstaller — silently
+	// fails without admin, and it would report success by saying nothing. The new marker sits
+	// inside a folder a standard user cannot even stat, but a leftover from a v4 build lives
+	// in C:\Windows\Temp where anyone can see it. Leaving the marker alone means the next
+	// elevated launch still finds it and finishes the job properly.
+	if (fileExists(statePath) || fileExists(legacyStatePath)) && isAdmin() {
 		connectBtn.SetEnabled(false)
 		setStatus("Finishing an interrupted session...", "The last support session did not close properly. Putting this PC back as it was.")
 		go func() {
@@ -309,22 +328,6 @@ func runGUI() {
 	mw.Run()
 }
 
-// allowedServer accepts only ProxyLink's own hosts over HTTPS. Anything else is ignored and
-// the build-time default stands, so a bad flag degrades to the correct server rather than
-// to a chosen one.
-func allowedServer(raw string) (string, bool) {
-	raw = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), "/"))
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.User != nil || u.Path != "" {
-		return "", false
-	}
-	host := u.Hostname()
-	if host != "proxylink.dev" && !strings.HasSuffix(host, serverDomainSuffix) {
-		return "", false
-	}
-	return u.Scheme + "://" + u.Host, true
-}
-
 func onConnect() {
 	code := strings.ToUpper(strings.TrimSpace(codeEdit.Text()))
 	if len(code) < 6 {
@@ -334,6 +337,9 @@ func onConnect() {
 	if !isAdmin() {
 		setStatus("Please run this tool as Administrator.", "Right-click the file and choose 'Run as administrator'.")
 		return
+	}
+	if st.isCleaning() {
+		return // teardown owns the machine until it finishes
 	}
 	st.code = code
 	codeEdit.SetEnabled(false)
@@ -361,10 +367,18 @@ func onConnect() {
 			return
 		}
 		mw.Synchronize(func() {
+			// Re-check: the customer may have closed the window while we were asking the
+			// server who is calling, and the dialog itself is answered at human speed.
+			if st.isCleaning() {
+				return
+			}
 			if !confirmTechnician(who) {
 				setStatus("Cancelled — nothing was changed on this computer.", "If you did not expect this, tell your IT provider.")
 				codeEdit.SetEnabled(true)
 				connectBtn.SetEnabled(true)
+				return
+			}
+			if st.isCleaning() {
 				return
 			}
 			st.flow.Add(1)
@@ -475,7 +489,7 @@ func runFlow(s *appState) {
 		return
 	}
 	s.mu.Lock()
-	s.expiresAt = parseExpiry(reg.ExpiresAt)
+	s.sessionLife = sessionLifeFrom(reg)
 	s.mu.Unlock()
 
 	if !s.wgWasInstalled {
@@ -538,12 +552,12 @@ func runFlow(s *appState) {
 // session never ended by itself. A session has a lifetime whether or not we can ask about it.
 func pollUntilEnded(s *appState) {
 	s.mu.Lock()
-	deadline := s.expiresAt
+	life := s.sessionLife
 	s.mu.Unlock()
-	hardStop := time.Now().Add(maxSessionLife)
-	if deadline.IsZero() || deadline.After(hardStop) {
-		deadline = hardStop
+	if life <= 0 || life > maxSessionLife {
+		life = maxSessionLife
 	}
+	deadline := time.Now().Add(life)
 
 	lastViewer := ""
 	for {
@@ -573,7 +587,28 @@ func pollUntilEnded(s *appState) {
 	mw.Synchronize(func() { mw.Close() }) // triggers cleanup via Closing handler
 }
 
-func parseExpiry(raw string) time.Time {
+// sessionLifeFrom turns the server's absolute expiry into how much longer the session has
+// to run, and it does the subtraction in the SERVER's clock, not this machine's.
+//
+// ⚠️ Never compare the server's expiry against the endpoint's local time. Consumer PCs run
+// with wildly wrong clocks, and a machine 45 minutes fast would read a 30-minute session as
+// already expired and tear the whole thing down about eight seconds after "Ready", while the
+// technician was still connecting. The Date header on the same response is the server saying
+// what time IT thinks it is, so expiry minus that is a duration both clocks agree on. Falls
+// back to the 4h backstop whenever anything is missing or nonsensical.
+func sessionLifeFrom(reg *registerResponse) time.Duration {
+	expires := parseTime(reg.ExpiresAt)
+	if expires.IsZero() || reg.serverNow.IsZero() {
+		return 0
+	}
+	life := expires.Sub(reg.serverNow)
+	if life <= 0 {
+		return 0
+	}
+	return life
+}
+
+func parseTime(raw string) time.Time {
 	if raw == "" {
 		return time.Time{}
 	}
@@ -645,6 +680,8 @@ func setupUltraVnc(passwdIni string, s *appState) error {
 	s.mu.Unlock()
 
 	if !preexisting {
+		// Record the firewall as we found it, before the installer adds anything to it.
+		snapshotFirewallRules()
 		setStatus("Downloading screen sharing (~5 MB)...", "")
 		if err := download(ultravncInstaller, vncSetupPath); err != nil {
 			return fmt.Errorf("download: %w", err)
@@ -674,6 +711,13 @@ func setupUltraVnc(passwdIni string, s *appState) error {
 		s.uvncDir, s.uvncService = dir, service
 		s.mu.Unlock()
 		writeState(s)
+	}
+
+	// ⚠️ Last chance to notice the session ended while the installer was running. Past this
+	// point we write the password and start the service; doing that after teardown has run
+	// leaves exactly what teardown existed to remove.
+	if s.isCleaning() {
+		return fmt.Errorf("session ended during setup")
 	}
 
 	// Stop anything holding port 5900 before rewriting config.
@@ -716,14 +760,26 @@ func setupUltraVnc(passwdIni string, s *appState) error {
 				return fmt.Errorf("back up ini: %w", err)
 			}
 		}
-		os.MkdirAll(filepath.Dir(iniPath), 0755)
-		if err := os.WriteFile(iniPath, []byte(ini), 0600); err != nil && iniPath == primary {
+		// If the config directory is not there we are creating it, so it is ours to own and
+		// lock. If it already exists it is the customer's and we leave its permissions alone.
+		if parent := filepath.Dir(iniPath); !fileExists(parent) {
+			if os.MkdirAll(parent, 0700) == nil {
+				takeOwnership(parent)
+				lockDownPath(parent, true)
+			}
+		}
+		// Remove first, then create exclusively: the same hardening download() uses, so we
+		// never write our password through a file or link somebody else left at this path.
+		if err := writeFileExclusive(iniPath, []byte(ini)); err != nil && iniPath == primary {
 			return fmt.Errorf("write ini: %w", err)
 		}
 		lockDownPath(iniPath, false)
 	}
 
 	// Install (if needed) and start the service.
+	if s.isCleaning() {
+		return fmt.Errorf("session ended during setup")
+	}
 	runHidden(filepath.Join(dir, "winvnc.exe"), "-install")
 	if service == "" {
 		service = uvncServiceName(dir)
@@ -759,9 +815,17 @@ func stopUvnc(dir, service string) {
 
 func removeUltraVnc(s *appState) {
 	snap := s.snapshot()
+	// Prefer the folder we recorded, but not if UltraVNC is not actually in it. A session that
+	// died between the download and the post-install re-resolve persisted the default 64-bit
+	// path; if the installer had put UltraVNC under Program Files (x86), the scoped uninstall
+	// would match nothing and our copy would be left installed and running.
 	dir := snap.UvncDir
-	if dir == "" {
-		dir = uvncDir()
+	if dir == "" || !fileExists(filepath.Join(dir, "winvnc.exe")) {
+		if uvncInstalled() {
+			dir = uvncDir()
+		} else if dir == "" {
+			dir = uvncDirs[0]
+		}
 	}
 	stopUvnc(dir, snap.UvncService)
 
@@ -769,10 +833,13 @@ func removeUltraVnc(s *appState) {
 	// that was not there before this session is ours and goes. Previously only backed-up
 	// files were handled, so an ini we created — carrying our session password — was left
 	// on the machine forever, in a folder the uninstaller does not clean.
+	restored := false
 	for _, p := range iniPaths(dir) {
 		if fileExists(p + ".plbak") {
 			os.Remove(p)
-			copyFile(p+".plbak", p)
+			if copyFile(p+".plbak", p) == nil {
+				restored = true
+			}
 			os.Remove(p + ".plbak")
 			continue
 		}
@@ -780,11 +847,18 @@ func removeUltraVnc(s *appState) {
 	}
 
 	if snap.VncWasInstalled {
-		svc := snap.UvncService
-		if svc == "" {
-			svc = defaultUvncSvc
+		// ⚠️ Only restart the service when we actually gave the customer their own config
+		// back. With no backup to restore we have just deleted the only ini on the machine,
+		// and starting the service now would leave a VNC server running with no password at
+		// all — worse than leaving it stopped. A stopped service is something they can start
+		// again; an unauthenticated one is an open door they cannot see.
+		if restored {
+			svc := snap.UvncService
+			if svc == "" {
+				svc = defaultUvncSvc
+			}
+			runHidden(`C:\Windows\System32\net.exe`, "start", svc)
 		}
-		runHidden(`C:\Windows\System32\net.exe`, "start", svc)
 		return
 	}
 
@@ -834,17 +908,32 @@ func addVncFirewallRule(s *appState, allowedIPs string) {
 	// When the VNC server was ALREADY here, its firewall rules are the customer's own and we
 	// leave them completely alone. Their exposure is their decision and it was exactly this
 	// wide before we arrived — adding a VPN-scoped rule alongside widens nothing.
-	if !snap.VncWasInstalled {
+	if !snap.VncWasInstalled && fileExists(fwSnapshotPath) {
 		dir := snap.UvncDir
 		if dir == "" {
 			dir = uvncDir()
 		}
-		runPowerShell(fmt.Sprintf(`$dir = '%s'
-		Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -ne '%s' } | ForEach-Object {
-		  $r = $_
-		  $p = ($r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program
-		  if ($p -and ($p -like ($dir + '\*'))) { $r | Remove-NetFirewallRule -ErrorAction SilentlyContinue }
-		}`, psEscape(dir), firewallRuleName))
+		// Two conditions, both required. The rule must have APPEARED while we were installing
+		// (it is not in the before-list), and it must either point at a binary in the folder we
+		// installed into or open a VNC port. A rule that predates us is the customer's whatever
+		// it is called, and a rule we caused is ours whatever shape the vendor gave it —
+		// program-based or port-based, which is not something we get to assume.
+		runPowerShell(fmt.Sprintf(`$before = @{}
+		Get-Content -LiteralPath '%s' -ErrorAction SilentlyContinue | ForEach-Object { $n = $_.Trim(); if ($n) { $before[$n] = $true } }
+		if ($before.Count -gt 0) {
+		  $dir = '%s'
+		  Get-NetFirewallRule -ErrorAction SilentlyContinue |
+		    Where-Object { $_.DisplayName -ne '%s' -and -not $before.ContainsKey($_.Name) } | ForEach-Object {
+		      $r = $_; $mine = $false
+		      $p = ($r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program
+		      if ($p -and ($p -like ($dir + '\*'))) { $mine = $true }
+		      if (-not $mine) {
+		        $pf = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+		        if ($pf -and (($pf.LocalPort -contains '5900') -or ($pf.LocalPort -contains '5800'))) { $mine = $true }
+		      }
+		      if ($mine) { $r | Remove-NetFirewallRule -ErrorAction SilentlyContinue }
+		    }
+		}`, psEscape(fwSnapshotPath), psEscape(dir), firewallRuleName))
 	}
 
 	// ⚠️ Scope the rule to the one address that ever connects. The server hands us the peer
@@ -859,6 +948,22 @@ func addVncFirewallRule(s *appState, allowedIPs string) {
 	runHidden(`C:\Windows\System32\netsh.exe`, "advfirewall", "firewall", "add", "rule",
 		"name="+firewallRuleName, "protocol=TCP", "dir=in", "localport=5900",
 		"remoteip="+remote, "action=allow", "profile=any")
+}
+
+// snapshotFirewallRules records the unique Name of every firewall rule currently on the
+// machine. Best-effort: if it fails, the file is absent and the sweep does not run at all,
+// which leaves the installer's own rule in place for the session rather than risking the
+// deletion of a rule that was never ours. Losing a customer's firewall rule is permanent;
+// leaving one of ours for a few minutes is not.
+func snapshotFirewallRules() {
+	out, err := runPowerShell(`Get-NetFirewallRule -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name`)
+	if err != nil || strings.TrimSpace(out) == "" {
+		os.Remove(fwSnapshotPath)
+		return
+	}
+	if err := os.WriteFile(fwSnapshotPath, []byte(out), 0600); err == nil {
+		lockDownPath(fwSnapshotPath, false)
+	}
 }
 
 // validRemoteIP accepts a single IP or CIDR, which is all the server ever sends and all
@@ -892,7 +997,15 @@ func cleanup(s *appState) {
 
 	// Wait for a half-finished setup rather than tearing down underneath it: closing the
 	// window during the UltraVNC install used to run both at once.
-	waitFor(&s.flow, 3*time.Minute)
+	//
+	// ⚠️ This budget must exceed what runFlow can legitimately take, which is both install
+	// timeouts back to back (5 min each) plus the waits between them. At three minutes the
+	// wait expired while the install was still going, teardown ran to completion, the process
+	// exited — and the install then finished behind it, writing our session password into the
+	// ini and starting the VNC service, with the state file already deleted so the next
+	// launch would not repair it. That is the outcome this whole audit exists to prevent,
+	// reached without an attacker.
+	flowFinished := waitFor(&s.flow, 12*time.Minute)
 
 	apiEnd(s.server, s.code) // tell the server to drop the peer immediately
 
@@ -910,9 +1023,14 @@ func cleanup(s *appState) {
 	}
 
 	// Last, so that a crash anywhere above leaves the marker behind and the next launch
-	// finishes the job.
-	os.Remove(statePath)
-	os.Remove(legacyStatePath)
+	// finishes the job. If setup was still running when we gave up waiting for it, the
+	// marker STAYS: we cannot say this machine is clean, and the next launch must be able
+	// to finish what we could not.
+	if flowFinished {
+		os.Remove(fwSnapshotPath)
+		os.Remove(statePath)
+		os.Remove(legacyStatePath)
+	}
 
 	s.mu.Lock()
 	s.cleanedUp = true
@@ -952,17 +1070,29 @@ func writeState(s *appState) {
 // readState loads the marker left by an interrupted session. Builds up to v4 wrote a single
 // "0"/"1" byte to C:\Windows\Temp; that file is still read here so this build can finish
 // cleaning up after one of them.
-func readState() (persistedState, bool) {
+func readState() (ps persistedState, found, legacy bool) {
 	if raw, err := os.ReadFile(statePath); err == nil {
-		var ps persistedState
 		if json.Unmarshal(raw, &ps) == nil {
-			return ps, true
+			ps.UvncDir = boundedUvncDir(ps.UvncDir)
+			return ps, true, false
 		}
 	}
 	if raw, err := os.ReadFile(legacyStatePath); err == nil {
-		return persistedState{VncWasInstalled: strings.TrimSpace(string(raw)) == "1"}, true
+		return persistedState{VncWasInstalled: strings.TrimSpace(string(raw)) == "1"}, true, true
 	}
-	return persistedState{}, false
+	return persistedState{}, false, false
+}
+
+// boundedUvncDir refuses any install folder that is not one of the two we ever install
+// into. The recorded path ends up in a recursive force-delete, so it must never be
+// something a state file can choose freely.
+func boundedUvncDir(dir string) string {
+	for _, d := range uvncDirs {
+		if strings.EqualFold(strings.TrimRight(dir, `\`), d) {
+			return d
+		}
+	}
+	return ""
 }
 
 // recoverPreviousSession undoes a session that never cleaned up after itself.
@@ -977,7 +1107,7 @@ func readState() (persistedState, bool) {
 //
 // Best-effort and silent: if there is nothing to recover it does nothing at all.
 func recoverPreviousSession() {
-	ps, ok := readState()
+	ps, ok, legacy := readState()
 	if !ok {
 		return // no interrupted session
 	}
@@ -988,7 +1118,22 @@ func recoverPreviousSession() {
 	// installed UltraVNC themselves, and removing software we cannot show we put there is the
 	// exact mistake this whole change is about.
 	preexisting := ps.VncWasInstalled
-	if !preexisting && !fileExists(vncSetupPath) && !fileExists(legacyVncSetupPath) {
+	if !preexisting && !fileExists(vncSetupPath) {
+		preexisting = true
+	}
+
+	// ⚠️ A LEGACY MARKER NEVER AUTHORISES AN UNINSTALL.
+	//
+	// Builds up to v4 kept both the marker and the downloaded installer in C:\Windows\Temp,
+	// where any signed-in user can create files. Two empty files planted there — a
+	// plsupport.state containing "0" and a plsupport-uvnc.exe — are enough to make the next
+	// elevated launch believe it installed the customer's own UltraVNC, and silently run
+	// their uninstaller and force-delete the folder. The evidence is forgeable, so it does
+	// not get a vote: a legacy marker means "undo OUR changes", never "remove software".
+	// This is the CLAUDE.md rule for unknown ownership — it restrains what we DELETE and
+	// never what we maintain. The cost is an idle UltraVNC left installed after a v4 crash;
+	// the alternative cost is deleting a stranger's software on a forged file.
+	if legacy {
 		preexisting = true
 	}
 	if ps.UvncDir == "" {
@@ -1025,6 +1170,18 @@ func forceCleanup(server, code string) {
 	removeVncFirewallRule()
 	dir := uvncDir()
 	stopUvnc(dir, uvncServiceName(dir))
+	// Give the customer their own config back if we have a copy of it. A file with no
+	// backup is deliberately left alone: this path can be run on a machine we never touched,
+	// and deleting an ini we cannot prove is ours is the one thing we never do. Our password
+	// stays behind in that case, on a stopped service, in an admin-only file — the session
+	// itself is already dead because the tunnel and the rule are gone.
+	for _, p := range iniPaths(dir) {
+		if fileExists(p + ".plbak") {
+			os.Remove(p)
+			copyFile(p+".plbak", p)
+			os.Remove(p + ".plbak")
+		}
+	}
 	removeTunnel()
 }
 
@@ -1084,6 +1241,10 @@ type registerResponse struct {
 	Keepalive       int    `json:"keepalive"`
 	VncPasswordIni  string `json:"vnc_password_ini"`
 	ExpiresAt       string `json:"expires_at"`
+
+	// The server's own clock, read from the response's Date header, so the expiry above can
+	// be turned into a duration without trusting this machine's time. See sessionLifeFrom.
+	serverNow time.Time
 }
 
 // whoResponse is who the server says is asking to connect.
@@ -1140,6 +1301,9 @@ func apiRegister(server, code, pubKey string) (*registerResponse, error) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&r); err != nil {
 		return nil, fmt.Errorf("invalid server response")
 	}
+	if d, err := http.ParseTime(resp.Header.Get("Date")); err == nil {
+		r.serverNow = d
+	}
 	return &r, nil
 }
 
@@ -1185,12 +1349,35 @@ func apiEnd(server, code string) {
 // and SYSTEM. Go's file modes do not map to Windows ACLs, so 0600 on a file under
 // C:\Windows\Temp bought nothing: any signed-in user could read the WireGuard private key,
 // or pre-create the installer path for us to truncate and then execute as Administrator.
+// ⚠️ AN ACL IS NOT ENOUGH — THE OWNER HAS TO BE TAKEN TOO.
+//
+// C:\ProgramData lets ordinary users create subfolders, and whoever creates one OWNS it. A
+// Windows object's owner keeps an implicit WRITE_DAC no matter what the DACL says, so a
+// standard user who pre-creates C:\ProgramData\ProxyLinkSupport before a session can hand
+// themselves back full control the instant after our icacls runs, and then swap the
+// hash-verified installer for their own in the gap between the check and the exec — which we
+// perform as Administrator. Moving off C:\Windows\Temp only closed the file version of that
+// hole; pre-creating the DIRECTORY walked straight back in. So: refuse a reparse point, take
+// ownership, and only then set the DACL.
 func prepareWorkDir() error {
+	// A junction planted at this path would silently relocate everything we write, including
+	// the installer we are about to run. Remove the link itself (never its target) and start
+	// again with a real directory.
+	if fi, err := os.Lstat(workDir); err == nil && fi.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+		os.Remove(workDir)
+	}
 	if err := os.MkdirAll(workDir, 0700); err != nil {
 		return err
 	}
+	takeOwnership(workDir)
 	lockDownPath(workDir, true)
 	return nil
+}
+
+// takeOwnership makes Administrators the owner of path and everything under it, so no
+// earlier owner keeps the implicit right to rewrite its permissions.
+func takeOwnership(path string) {
+	runHidden(`C:\Windows\System32\icacls.exe`, path, "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q")
 }
 
 func lockDownPath(path string, container bool) {
@@ -1263,7 +1450,23 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dst, b, 0600)
+	return writeFileExclusive(dst, b)
+}
+
+// writeFileExclusive removes any existing path and creates the file fresh, so a plain
+// truncating write can never follow a link or reuse a handle somebody else established.
+func writeFileExclusive(path string, data []byte) error {
+	os.Remove(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	_, wErr := f.Write(data)
+	cErr := f.Close()
+	if wErr != nil {
+		return wErr
+	}
+	return cErr
 }
 
 // psEscape makes a value safe to embed inside a PowerShell single-quoted string.
@@ -1272,13 +1475,16 @@ func psEscape(v string) string {
 }
 
 // waitFor blocks on wg, but never longer than d: a stuck installer must not leave the
-// customer staring at "cleaning up" forever.
-func waitFor(wg *sync.WaitGroup, d time.Duration) {
+// customer staring at "cleaning up" forever. Reports whether the wait actually completed —
+// a timeout means work is still running and cleanup cannot claim the machine is clean.
+func waitFor(wg *sync.WaitGroup, d time.Duration) bool {
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
 	select {
 	case <-done:
+		return true
 	case <-time.After(d):
+		return false
 	}
 }
 
