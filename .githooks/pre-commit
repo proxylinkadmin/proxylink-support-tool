@@ -1,0 +1,71 @@
+#!/bin/bash
+# Secret guard for the ProxyLink Support Tool — THIS REPO IS PUBLIC.
+#
+# A credential committed here is on the open internet the moment it is pushed. There is
+# no private window in which to notice and no way to un-publish it: it is in the object
+# history, in every clone, and in GitHub's forks/events API within seconds.
+#
+# The app repo (/var/www/skipdns) has carried this guard for a while. This repo did not,
+# which is backwards — it is the one that gets pushed casually because "it is only the
+# client", and it is the one where a slip is irreversible.
+#
+# This catches ONE class of accident: a recognisable credential shape in staged content.
+# It is a seatbelt, not a security system. It cannot catch a secret in a format it does
+# not know, and it does nothing about anything already published.
+#
+# Enable after a fresh clone (local config, never cloned):
+#     git config core.hooksPath .githooks
+
+set -uo pipefail
+
+staged_files=$(git diff --cached --name-only --diff-filter=ACM)
+
+# ── 1. Never commit env files ────────────────────────────────────────────────────
+for f in $staged_files; do
+  case "$(basename "$f")" in
+    .env.example) : ;;
+    .env|.env.*)
+      echo >&2 ""
+      echo >&2 "  BLOCKED: refusing to commit '$f' — env files hold live secrets."
+      echo >&2 "  This repo is PUBLIC. Do not force an env file into its history."
+      echo >&2 ""
+      exit 1 ;;
+  esac
+done
+
+# ── 2. Never commit build output ─────────────────────────────────────────────────
+# dist/ and *.exe are gitignored, but this stops an explicit `git add -f`. A signed
+# binary in git history is not a secret, but it bloats every clone forever and invites
+# someone to trust a build nobody can reproduce. The release lives on the download page.
+for f in $staged_files; do
+  case "$f" in
+    dist/*|*.exe|*.syso)
+      echo >&2 ""
+      echo >&2 "  BLOCKED: '$f' is build output, not source."
+      echo >&2 "  Releases are served from proxylink.dev/download, not committed here."
+      echo >&2 ""
+      exit 1 ;;
+  esac
+done
+
+# ── 3. Credential shapes in ADDED lines only ─────────────────────────────────────
+# Added lines only, so an existing false positive never blocks unrelated work.
+added=$(git diff --cached -U0 --diff-filter=ACM | grep '^+' | grep -vE '^\+\+\+' || true)
+
+# Generic live-credential shapes, plus the ProxyLink server secrets that must NEVER
+# appear in client source (the client is untrusted by design and needs none of them).
+secret_re='ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|cfut_[A-Za-z0-9_-]{20,}|ops_[A-Za-z0-9+/=_-]{40,}|sk_live_[A-Za-z0-9]{16,}|rk_live_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|re_[A-Za-z0-9_]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|APP_KEY=base64:[A-Za-z0-9+/=]{20,}|(GUAC_SECRET|TERMINAL_SECRET|INTERNAL_SECRET|WG_PRIVATE_KEY|DB_PASSWORD)[[:space:]]*[:=][[:space:]]*[^[:space:]"'"'"']{8,}'
+
+if echo "$added" | grep -Eq "$secret_re"; then
+  echo >&2 ""
+  echo >&2 "  BLOCKED: a staged line looks like a live secret."
+  echo >&2 "  Matched near:"
+  echo "$added" | grep -Eo "$secret_re" | sed -E 's/(.{10}).*/  \1…[redacted]/' | sort -u | head >&2
+  echo >&2 ""
+  echo >&2 "  THIS REPO IS PUBLIC — a push makes this permanent and unrecallable."
+  echo >&2 "  Remove it. If it has already been pushed anywhere, rotate it first."
+  echo >&2 ""
+  exit 1
+fi
+
+exit 0
