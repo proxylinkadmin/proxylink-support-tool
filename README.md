@@ -6,7 +6,7 @@ Maintained by **Filippos Iliadis** (ProxyLink), Thessaloniki, Greece.
 
 A technician creates a support session in ProxyLink and sends the customer a short code.
 The customer runs this tool, enters the code, and the technician gets a browser-based view
-of their screen — for exactly as long as the session lasts, and no longer.
+of their screen, for exactly as long as the session lasts and no longer.
 
 **This tool is open source on purpose.** It runs on a customer's machine with administrator
 rights, so you should be able to read every line of what it does. Nothing is hidden.
@@ -15,24 +15,39 @@ rights, so you should be able to read every line of what it does. Nothing is hid
 
 When the customer enters their code and clicks **Connect**, the tool:
 
-1. Asks ProxyLink **who** created that session, and shows the customer the technician's name
-   and company before anything on the machine is touched. The customer has to agree to that
-   named person. If the server cannot say who is asking, the tool does not connect.
+1. Asks ProxyLink **who** created that session and puts the question to the customer before
+   anything on the machine is touched: *did you call this company yourself?* If the server
+   cannot say who is asking, the tool does not connect.
 2. Generates a WireGuard key pair on the machine (the private key never leaves it).
 3. Registers with ProxyLink and brings up a WireGuard tunnel to the relay.
-4. Installs [UltraVNC](https://uvnc.com) and configures it with a **password** supplied by the
-   server, with authentication required.
-5. Adds a single Windows Firewall rule allowing VNC (port 5900) **only** over the WireGuard
-   tunnel — never from the local network or the internet.
+4. Installs [UltraVNC](https://uvnc.com), verifying the installer against a hash compiled into
+   this program before running it, then configures it with a **password** supplied by the
+   server, with authentication required and loopback connections refused.
+5. Adds a single Windows Firewall rule allowing VNC (port 5900) **only** from the one relay
+   address the server hands back. Not from the local network, and not from the internet.
 6. Tells the server it is ready. The technician can now view the screen in their browser.
 
-When the session ends — the technician ends it, it expires, or the customer closes the window —
-the tool removes the firewall rule, stops and (if it installed it) uninstalls UltraVNC, and
-tears down the WireGuard tunnel. **It installs no service or scheduled task; nothing is left
-running or auto-starting afterwards.**
+When the session ends, whether the technician ends it, it expires, or the customer closes the
+window, the tool removes the firewall rule, restores or removes the VNC configuration, uninstalls
+UltraVNC if it was the one that installed it, and tears down the WireGuard tunnel including the
+copy of the tunnel config Windows keeps for itself. **It installs no service or scheduled task;
+nothing is left running or auto-starting afterwards.**
 
-If a machine you already run UltraVNC on is used for support, the tool backs up your existing
-configuration and restores it when the session ends.
+If a session is interrupted, by the window being killed, a power cut, or someone simply shutting
+the lid, the next launch notices and finishes the teardown before anything else can happen.
+There is also a manual recovery mode, `plsupport.exe -cleanup CODE`, which cuts remote access
+immediately.
+
+## If the machine already has UltraVNC
+
+Plenty of IT companies already run UltraVNC on the machines they look after. **What was here
+before we arrived is yours.** The tool backs up your existing configuration and puts it back
+when the session ends, it never uninstalls a VNC server it did not install, and it leaves your
+own firewall rules alone. The rule it adds sits alongside them and is removed afterwards.
+
+Ownership is decided once, the first time the tool looks at the machine, and remembered. After
+we have installed something, the machine can no longer tell us who installed it, so a later
+retry is never allowed to change that answer.
 
 ## Why it asks who is calling
 
@@ -40,18 +55,35 @@ This tool is downloaded from a public page, so anyone can be talked into fetchin
 in a code read to them over the telephone. That is the tech-support scam, step for step, and it
 is what remote access tools are routinely abused for.
 
-The defence is that the name shown to the customer comes from ProxyLink's own records of who
-opened the session, not from anything the caller can supply. A criminal running this tool cannot
-put their own words in that dialog. The prompt asks the customer plainly whether they made the
-call themselves, and **No** is the default button, so a person clicking through a dialog they do
-not understand ends up not connected.
+**The name in that dialog is a claim, not a credential**, and the tool says so in as many words:
+it shows "someone who says they are…". Anyone can open a ProxyLink account and choose what to
+call themselves, so we do not ask the customer to trust the name, and this program's signature
+is not a vouch for whoever's name appears in it.
+
+The defence is the question, which is put first and which works no matter whose name is shown:
+*did you call them yourself?* The scam depends entirely on the customer not having made the
+call, so it is something they can answer from certain knowledge, in their own terms. The
+question names their own IT company, because that is who they rang, not us. **No** is the
+default button, so a person clicking through a dialog they do not understand ends up not
+connected.
 
 ## Security
 
-- The customer is shown who is asking to connect, by name, before the machine is touched, and
-  the tool fails closed if it cannot establish that.
+- The customer is asked, before the machine is touched, whether they made the call, and the
+  tool fails closed if it cannot establish who opened the session.
 - The VNC password is generated by the server per session and is never stored in this tool's code.
-- VNC is reachable only through the WireGuard tunnel (firewall-scoped to the tunnel range).
+- VNC is reachable only through the WireGuard tunnel, and the firewall rule is scoped to the
+  single relay address rather than the tunnel's whole address range.
+- UltraVNC is configured to refuse loopback connections, and its configuration file is written
+  with inheritance stripped and access limited to Administrators and SYSTEM, so another user
+  signed in to the same machine cannot read the session password out of it.
+- Anything downloaded and then executed with administrator rights is verified first: our
+  UltraVNC installer against a SHA-256 pinned in this source, WireGuard's against its
+  Authenticode signature.
+- Downloads and the WireGuard private key are written to a working directory this tool owns and
+  locks to Administrators and SYSTEM, rather than to a shared temporary folder.
+- The `-server=` flag accepts only ProxyLink's own hosts over HTTPS; anything else is ignored
+  and the built-in default stands.
 - The private WireGuard key is generated on the machine and never transmitted.
 - No persistence: no service, scheduled task, or autostart entry is left installed after a session.
 
@@ -61,10 +93,16 @@ Cross-compiles from any platform with Go 1.22+ and `x86_64-w64-mingw32-windres`:
 
 ```sh
 ./build.sh
+go test ./cmd/plsupport/
 ```
 
-Produces a Windows GUI executable (`lxn/walk`, no CGO).
+Produces a Windows GUI executable (`lxn/walk`, no CGO). Released builds are Authenticode-signed;
+a released binary reports the commit it was built from, and that it was built from a clean tree:
+
+```sh
+go version -m ProxyLinkSupport.exe | grep vcs.
+```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
