@@ -402,20 +402,40 @@ func onConnect() {
 // The safe answer is the default: the dialog's No button is what Escape and the close box
 // both pick, because a person clicking through a dialog they do not understand should end
 // up not connected.
+//
+// ⚠️ THE QUESTION NAMES THE MSP, NOT US. It used to ask "did you contact ProxyLink support
+// yourself?" and that is a question about a company the customer has never heard of. They do
+// not call ProxyLink; they call Powertech, or they call Mitsos. A safety question the person
+// cannot answer from certain knowledge is not a safety question, it is a dialog they click
+// through — so it has to be phrased in the terms of the call they actually remember making.
 func confirmTechnician(who *whoResponse) bool {
 	from := who.Technician
 	if who.Company != "" {
 		from = fmt.Sprintf("%s (%s)", who.Technician, who.Company)
 	}
+
+	// Who the customer thinks they rang: their provider's company if we know it, otherwise the
+	// engineer by name (a one-man MSP is a name, not a company), otherwise a generic phrasing.
+	// The server already defaults the technician to "your IT provider", which reads correctly
+	// in this sentence on its own.
+	called := strings.TrimSpace(who.Company)
+	if called == "" {
+		called = strings.TrimSpace(who.Technician)
+	}
+	lead := "Did you call for IT support yourself?"
+	if called != "" {
+		lead = fmt.Sprintf("Did you call %s yourself?", called)
+	}
+
 	msg := fmt.Sprintf(
-		"Did you contact ProxyLink support yourself?\n\n"+
+		"%s\n\n"+
 			"Someone who says they are\n"+
 			"    %s\n"+
 			"is asking to see this computer's screen.\n\n"+
 			"Press Yes only if YOU called them and they are expecting you.\n\n"+
 			"If someone called you out of the blue, about a virus, your bank, "+
 			"or Microsoft, press No.",
-		from)
+		lead, from)
 
 	return walk.MsgBox(mw, "Allow this connection?", msg,
 		walk.MsgBoxYesNo|walk.MsgBoxIconWarning|walk.MsgBoxDefButton2) == win.IDYES
