@@ -33,6 +33,7 @@ import (
 
 	"github.com/lxn/walk"
 	dcl "github.com/lxn/walk/declarative"
+	"github.com/lxn/win"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/sys/windows"
 )
@@ -200,7 +201,62 @@ func onConnect() {
 	st.code = code
 	codeEdit.SetEnabled(false)
 	connectBtn.SetEnabled(false)
-	go runFlow(st)
+
+	// ⚠️ ASK WHO, AND ASK THE CUSTOMER, BEFORE TOUCHING THE MACHINE.
+	//
+	// The download page is public: anyone can be talked into fetching this tool and typing
+	// a code read to them over the telephone. That is the tech-support scam, word for word,
+	// and it is the flow TeamViewer and AnyDesk are used for. The single thing a criminal
+	// cannot fake is OUR record of which technician opened the session — so we fetch the
+	// name from the server and make the customer agree to that specific person by name.
+	//
+	// Fails CLOSED. If we cannot say who is on the other end, we do not connect: a guard
+	// that can be skipped by blocking one request is not a guard.
+	setStatus("Checking who is asking to connect...", "")
+	go func() {
+		who, err := apiWho(st.server, code)
+		if err != nil {
+			mw.Synchronize(func() {
+				setStatus("Could not check this code: "+err.Error(), "Nothing has been changed on this computer. Check the code with your technician and try again.")
+				codeEdit.SetEnabled(true)
+				connectBtn.SetEnabled(true)
+			})
+			return
+		}
+		mw.Synchronize(func() {
+			if !confirmTechnician(who) {
+				setStatus("Cancelled — nothing was changed on this computer.", "If you did not expect this, tell your IT provider.")
+				codeEdit.SetEnabled(true)
+				connectBtn.SetEnabled(true)
+				return
+			}
+			go runFlow(st)
+		})
+	}()
+}
+
+// confirmTechnician shows the customer who is asking and waits for a yes.
+//
+// Deliberately NOT a friendly "Connect?" prompt. It names the person, and it puts the
+// scam question — did YOU make this call? — in front of them while they can still say no.
+// The safe answer is the default: the dialog's No button is what Escape and the close box
+// both pick, because a person clicking through a dialog they do not understand should end
+// up not connected.
+func confirmTechnician(who *whoResponse) bool {
+	from := who.Technician
+	if who.Company != "" {
+		from = fmt.Sprintf("%s (%s)", who.Technician, who.Company)
+	}
+	msg := fmt.Sprintf(
+		"%s is asking to connect to this computer.\n\n"+
+			"Only continue if YOU contacted them yourself and they are expecting you.\n\n"+
+			"If someone called you out of the blue — saying they are from Microsoft, your bank, "+
+			"or that your computer has a virus — choose No. They are not who they say they are.\n\n"+
+			"Allow %s to see your screen?",
+		from, who.Technician)
+
+	return walk.MsgBox(mw, "Allow this connection?", msg,
+		walk.MsgBoxYesNo|walk.MsgBoxIconWarning|walk.MsgBoxDefButton2) == win.IDYES
 }
 
 // setStatus updates the two status lines from any goroutine.
@@ -624,6 +680,37 @@ type registerResponse struct {
 	Keepalive       int    `json:"keepalive"`
 	VncPasswordIni  string `json:"vnc_password_ini"`
 	ExpiresAt       string `json:"expires_at"`
+}
+
+// whoResponse is who the server says is asking to connect.
+type whoResponse struct {
+	Technician string `json:"technician"`
+	Company    string `json:"company"`
+}
+
+// apiWho asks the server who created this session, BEFORE anything on this machine is
+// touched. The answer comes from ProxyLink's own records — a caller cannot supply it —
+// which is the one thing a scammer running our script cannot forge.
+func apiWho(server, code string) (*whoResponse, error) {
+	resp, err := http.Get(fmt.Sprintf("%s/api/support/%s/who", server, code))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 404:
+		return nil, fmt.Errorf("code not found or expired")
+	case 429:
+		return nil, fmt.Errorf("too many attempts, wait a moment")
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("server error %d", resp.StatusCode)
+	}
+	var w whoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&w); err != nil {
+		return nil, fmt.Errorf("invalid server response")
+	}
+	return &w, nil
 }
 
 func apiRegister(server, code, pubKey string) (*registerResponse, error) {
