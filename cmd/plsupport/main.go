@@ -10,12 +10,12 @@
 //
 // Recovery mode: `plsupport.exe -cleanup CODE` force-removes everything a session set up
 // (stops VNC, drops the tunnel, removes the firewall rule). Requires admin (embedded UAC
-// manifest). The tool installs no service or scheduled task — nothing persists after a session.
+// manifest). The tool installs no service or scheduled task, so nothing persists after a session.
 //
 // ⚠️ THE GOVERNING RULE OF THIS FILE (same one the Windows deploy follows):
 // if a VNC server, a firewall rule or a config file was here before we arrived, it is the
 // customer's and we put it back exactly as we found it. If we created it, we remove it.
-// Ownership is decided ONCE, on first contact, and recorded — never re-probed, because after
+// Ownership is decided ONCE, on first contact, and recorded, never re-probed, because after
 // we have installed something the machine can no longer tell us who installed it.
 
 package main
@@ -117,7 +117,7 @@ var uvncDirs = []string{
 
 // HTTP clients. Neither may use http.DefaultClient, which has no timeout at all: a
 // black-holed connection would hang the flow forever with both controls disabled, and the
-// only way out for the customer is End Task — which is precisely the interrupted teardown
+// only way out for the customer is End Task, which is precisely the interrupted teardown
 // that leaves our password on their machine.
 var (
 	apiClient      = &http.Client{Timeout: 20 * time.Second}
@@ -206,7 +206,7 @@ func runGUI() {
 	for _, a := range os.Args[1:] {
 		if strings.HasPrefix(a, "-server=") {
 			// ⚠️ NOT free-form. The server named here decides who the consent dialog says is
-			// calling, what Endpoint the tunnel dials, and what password guards the screen —
+			// calling, what Endpoint the tunnel dials, and what password guards the screen,
 			// so an attacker who can choose it can author the whole trust story while our
 			// signed binary vouches for it. Only ProxyLink's own hosts over HTTPS.
 			if v, ok := allowedServer(strings.TrimPrefix(a, "-server=")); ok {
@@ -251,14 +251,14 @@ func runGUI() {
 
 	// Closing the window ends the session. Cleanup (stop VNC, uninstall, drop the tunnel) takes
 	// a few seconds, so it runs on a background goroutine with a visible status: cancel the
-	// first close, clean up, then close for real when it finishes — keeping the window responsive.
+	// first close, clean up, then close for real when it finishes, keeping the window responsive.
 	//
 	// ⚠️ ORDER MATTERS AND IS NOT COSMETIC. `cleaning` must be tested BEFORE `cleanedUp`.
 	// cleanup() begins by telling the server the session has ended; the status poll sees
 	// "ended" 8 seconds later and calls Close(). If that Close is allowed through while
 	// teardown is still running, the process exits mid-cleanup and the customer keeps our
 	// session password in their ultravnc.ini with the service running. Teardown routinely
-	// takes longer than 8 seconds — an UltraVNC uninstall always does. This is the everyday
+	// takes longer than 8 seconds. An UltraVNC uninstall always does. This is the everyday
 	// path, not an attack.
 	mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		st.mu.Lock()
@@ -273,7 +273,7 @@ func runGUI() {
 			return
 		}
 		if done {
-			return // cleanup finished — allow the window to close
+			return // cleanup finished, allow the window to close
 		}
 
 		*canceled = true
@@ -281,11 +281,11 @@ func runGUI() {
 		// and a customer who then closes the window can still click Connect while teardown is
 		// running: a second runFlow would reinstall UltraVNC and rewrite the ini while cleanup
 		// removes them, and its WaitGroup.Add would race cleanup's Wait, which Go documents as
-		// misuse and which can panic the process mid-teardown — the exact failure this whole
+		// misuse and which can panic the process mid-teardown, the exact failure this whole
 		// change exists to prevent.
 		codeEdit.SetEnabled(false)
 		connectBtn.SetEnabled(false)
-		setStatus("Ending session — cleaning up...", "Removing screen sharing and the secure tunnel. This takes a few seconds.")
+		setStatus("Ending session, cleaning up...", "Removing screen sharing and the secure tunnel. This takes a few seconds.")
 		go func() {
 			cleanup(st)
 			mw.Synchronize(func() {
@@ -296,11 +296,11 @@ func runGUI() {
 	})
 
 	// Finish any session that died without cleaning up (see recoverPreviousSession). It
-	// can take a few seconds — an UltraVNC uninstall is involved — so it runs off the UI
+	// can take a few seconds (an UltraVNC uninstall is involved), so it runs off the UI
 	// thread with Connect disabled, rather than freezing the window on launch. The common
 	// case is that there is nothing to do and this is over instantly.
 	//
-	// ⚠️ Only when elevated. Every step of it — icacls, net stop, the uninstaller — silently
+	// ⚠️ Only when elevated. Every step of it, icacls, net stop and the uninstaller, silently
 	// fails without admin, and it would report success by saying nothing. The new marker sits
 	// inside a folder a standard user cannot even stat, but a leftover from a v4 build lives
 	// in C:\Windows\Temp where anyone can see it. Leaving the marker alone means the next
@@ -350,7 +350,7 @@ func onConnect() {
 	// The download page is public: anyone can be talked into fetching this tool and typing
 	// a code read to them over the telephone. That is the tech-support scam, word for word,
 	// and it is the flow TeamViewer and AnyDesk are used for. The single thing a criminal
-	// cannot fake is OUR record of which technician opened the session — so we fetch the
+	// cannot fake is OUR record of which technician opened the session, so we fetch the
 	// name from the server and make the customer agree to that specific person by name.
 	//
 	// Fails CLOSED. If we cannot say who is on the other end, we do not connect: a guard
@@ -373,7 +373,7 @@ func onConnect() {
 				return
 			}
 			if !confirmTechnician(who) {
-				setStatus("Cancelled — nothing was changed on this computer.", "If you did not expect this, tell your IT provider.")
+				setStatus("Cancelled. Nothing was changed on this computer.", "If you did not expect this, tell your IT provider.")
 				codeEdit.SetEnabled(true)
 				connectBtn.SetEnabled(true)
 				return
@@ -390,7 +390,7 @@ func onConnect() {
 // confirmTechnician shows the customer who is asking and waits for a yes.
 //
 // Deliberately NOT a friendly "Connect?" prompt. It leads with the one question that works
-// no matter whose name appears — did YOU make this call? — because the scam depends entirely
+// no matter whose name appears, did YOU make this call, because the scam depends entirely
 // on the customer not having called anyone. The name is presented as a CLAIM ("someone who
 // says they are"), never as a credential: signup is open, so the name is chosen by whoever
 // opened the session, and our signed binary must not be read as vouching for it.
@@ -407,7 +407,7 @@ func onConnect() {
 // yourself?" and that is a question about a company the customer has never heard of. They do
 // not call ProxyLink; they call Powertech, or they call Mitsos. A safety question the person
 // cannot answer from certain knowledge is not a safety question, it is a dialog they click
-// through — so it has to be phrased in the terms of the call they actually remember making.
+// through, so it has to be phrased in the terms of the call they actually remember making.
 func confirmTechnician(who *whoResponse) bool {
 	from := who.Technician
 	if who.Company != "" {
@@ -522,7 +522,7 @@ func runFlow(s *appState) {
 
 	// ⚠️ Set BEFORE the machine is modified, not after. A failure part-way through leaves
 	// real changes behind, and a flag set only on success tells cleanup there is nothing to
-	// undo — which is how a half-finished session used to become permanent damage.
+	// undo, which is how a half-finished session used to become permanent damage.
 	s.mu.Lock()
 	s.wgTouched = true
 	s.mu.Unlock()
@@ -558,7 +558,7 @@ func runFlow(s *appState) {
 		return
 	}
 
-	setStatus("Ready — waiting for your technician to connect...", "Keep this window open. You'll see here the moment they connect.")
+	setStatus("Ready. Waiting for your technician to connect...", "Keep this window open. You'll see here the moment they connect.")
 
 	go pollUntilEnded(s)
 }
@@ -567,8 +567,8 @@ func runFlow(s *appState) {
 // dropping. It also reflects when the technician actually connects or disconnects, so the
 // customer isn't left guessing.
 //
-// ⚠️ It carries the local expiry backstop. Every status request failing — the machine loses
-// its internet, or the server is unreachable — used to mean the loop span forever and the
+// ⚠️ It carries the local expiry backstop. Every status request failing, whether the machine loses
+// its internet, its internet or the server is unreachable, used to mean the loop span forever and the
 // session never ended by itself. A session has a lifetime whether or not we can ask about it.
 func pollUntilEnded(s *appState) {
 	s.mu.Lock()
@@ -677,8 +677,8 @@ func uvncServiceName(dir string) string {
 	return defaultUvncSvc
 }
 
-// iniPaths returns both config locations the service might load — install folder and
-// ProgramData — so the password takes effect regardless of the build.
+// iniPaths returns both config locations the service might load, the install folder and
+// ProgramData, so the password takes effect regardless of the build.
 func iniPaths(dir string) []string {
 	if dir == "" {
 		dir = uvncDir()
@@ -851,7 +851,7 @@ func removeUltraVnc(s *appState) {
 
 	// Put every config back the way we found it. A file we backed up is restored; a file
 	// that was not there before this session is ours and goes. Previously only backed-up
-	// files were handled, so an ini we created — carrying our session password — was left
+	// files were handled, so an ini we created, carrying our session password, was left
 	// on the machine forever, in a folder the uninstaller does not clean.
 	restored := false
 	for _, p := range iniPaths(dir) {
@@ -870,7 +870,7 @@ func removeUltraVnc(s *appState) {
 		// ⚠️ Only restart the service when we actually gave the customer their own config
 		// back. With no backup to restore we have just deleted the only ini on the machine,
 		// and starting the service now would leave a VNC server running with no password at
-		// all — worse than leaving it stopped. A stopped service is something they can start
+		// all, which is worse than leaving it stopped. A stopped service is something they can start
 		// again; an unauthenticated one is an open door they cannot see.
 		if restored {
 			svc := snap.UvncService
@@ -882,7 +882,7 @@ func removeUltraVnc(s *appState) {
 		return
 	}
 
-	// We installed it — run the Inno uninstaller.
+	// We installed it, so run the Inno uninstaller.
 	uninstallUltraVncSilently(dir)
 }
 
@@ -919,7 +919,7 @@ func addVncFirewallRule(s *appState, allowedIPs string) {
 	// is ours to clean up because we caused it.
 	//
 	// The guard is "no winvnc.exe in the two uvnc-bvba folders", but the old sweep deleted
-	// every rule whose name merely matched VNC|winvnc|uvnc — so a customer running RealVNC,
+	// every rule whose name merely matched VNC|winvnc|uvnc, so a customer running RealVNC,
 	// TightVNC or TigerVNC (17 TightVNC machines in the fleet) lost their own rules
 	// permanently, with nothing recorded anywhere to put them back. Matching on the rule's
 	// program path is a POSITIVE ownership signal: it can only hit binaries in the folder we
@@ -927,7 +927,7 @@ func addVncFirewallRule(s *appState, allowedIPs string) {
 	//
 	// When the VNC server was ALREADY here, its firewall rules are the customer's own and we
 	// leave them completely alone. Their exposure is their decision and it was exactly this
-	// wide before we arrived — adding a VPN-scoped rule alongside widens nothing.
+	// wide before we arrived, and adding a VPN-scoped rule alongside widens nothing.
 	if !snap.VncWasInstalled && fileExists(fwSnapshotPath) {
 		dir := snap.UvncDir
 		if dir == "" {
@@ -936,7 +936,7 @@ func addVncFirewallRule(s *appState, allowedIPs string) {
 		// Two conditions, both required. The rule must have APPEARED while we were installing
 		// (it is not in the before-list), and it must either point at a binary in the folder we
 		// installed into or open a VNC port. A rule that predates us is the customer's whatever
-		// it is called, and a rule we caused is ours whatever shape the vendor gave it —
+		// it is called, and a rule we caused is ours whatever shape the vendor gave it,
 		// program-based or port-based, which is not something we get to assume.
 		runPowerShell(fmt.Sprintf(`$before = @{}
 		Get-Content -LiteralPath '%s' -ErrorAction SilentlyContinue | ForEach-Object { $n = $_.Trim(); if ($n) { $before[$n] = $true } }
@@ -1021,7 +1021,7 @@ func cleanup(s *appState) {
 	// ⚠️ This budget must exceed what runFlow can legitimately take, which is both install
 	// timeouts back to back (5 min each) plus the waits between them. At three minutes the
 	// wait expired while the install was still going, teardown ran to completion, the process
-	// exited — and the install then finished behind it, writing our session password into the
+	// exited, and the install then finished behind it, writing our session password into the
 	// ini and starting the VNC service, with the state file already deleted so the next
 	// launch would not repair it. That is the outcome this whole audit exists to prevent,
 	// reached without an attacker.
@@ -1119,8 +1119,8 @@ func boundedUvncDir(dir string) string {
 //
 // ⚠️ Cleanup only ran when the window was closed. End Task, a crash, a power cut or a
 // client simply shutting the lid and rebooting left the machine with OUR session password
-// in their ultravnc.ini, our WireGuard tunnel service installed, and — before the fix
-// above — their own VNC firewall rules deleted. Nothing ever put any of it back, and the
+// in their ultravnc.ini, our WireGuard tunnel service installed, and, before the fix
+// above, their own VNC firewall rules deleted. Nothing ever put any of it back, and the
 // client had no way to know. The .plbak files and this marker are the evidence needed to
 // finish the job on the next launch, so the tool repairs itself instead of leaving damage
 // behind on a stranger's PC.
@@ -1133,7 +1133,7 @@ func recoverPreviousSession() {
 	}
 
 	// If the dead session installed UltraVNC itself, our downloaded installer is still
-	// sitting in our working folder — cleanup deletes it, so its presence is proof. Without
+	// sitting in our working folder. Cleanup deletes it, so its presence is proof. Without
 	// that proof we do not run an uninstaller: between the two launches the client may have
 	// installed UltraVNC themselves, and removing software we cannot show we put there is the
 	// exact mistake this whole change is about.
@@ -1145,8 +1145,8 @@ func recoverPreviousSession() {
 	// ⚠️ A LEGACY MARKER NEVER AUTHORISES AN UNINSTALL.
 	//
 	// Builds up to v4 kept both the marker and the downloaded installer in C:\Windows\Temp,
-	// where any signed-in user can create files. Two empty files planted there — a
-	// plsupport.state containing "0" and a plsupport-uvnc.exe — are enough to make the next
+	// where any signed-in user can create files. Two empty files planted there, a
+	// plsupport.state containing "0" and a plsupport-uvnc.exe, are enough to make the next
 	// elevated launch believe it installed the customer's own UltraVNC, and silently run
 	// their uninstaller and force-delete the folder. The evidence is forgeable, so it does
 	// not get a vote: a legacy marker means "undo OUR changes", never "remove software".
@@ -1183,7 +1183,7 @@ func recoverPreviousSession() {
 
 // forceCleanup is the manual recovery path (-cleanup CODE): it cuts remote access by stopping
 // VNC and removing the tunnel + firewall rule. It does not uninstall UltraVNC, which may be the
-// customer's own. The tool installs no scheduled task or other persistence — nothing is left
+// customer's own. The tool installs no scheduled task or other persistence, so nothing is left
 // running or auto-starting on the machine after a session.
 func forceCleanup(server, code string) {
 	apiEnd(server, code)
@@ -1193,7 +1193,7 @@ func forceCleanup(server, code string) {
 	// Give the customer their own config back if we have a copy of it. A file with no
 	// backup is deliberately left alone: this path can be run on a machine we never touched,
 	// and deleting an ini we cannot prove is ours is the one thing we never do. Our password
-	// stays behind in that case, on a stopped service, in an admin-only file — the session
+	// stays behind in that case, on a stopped service, in an admin-only file. The session
 	// itself is already dead because the tunnel and the rule are gone.
 	for _, p := range iniPaths(dir) {
 		if fileExists(p + ".plbak") {
@@ -1229,8 +1229,8 @@ func downloadAndInstallWireGuard() error {
 	if err := download(wireguardInstaller, tmp); err != nil {
 		return err
 	}
-	// About to run as Administrator. We cannot pin a hash for someone else's installer —
-	// they publish new versions — so we require a valid Authenticode signature instead.
+	// About to run as Administrator. We cannot pin a hash for someone else's installer, because
+	// they publish new versions, so we require a valid Authenticode signature instead.
 	if err := verifyAuthenticode(tmp); err != nil {
 		os.Remove(tmp)
 		return err
@@ -1274,7 +1274,7 @@ type whoResponse struct {
 }
 
 // apiWho asks the server who created this session, BEFORE anything on this machine is
-// touched. The answer comes from ProxyLink's own records — a caller cannot supply it —
+// touched. The answer comes from ProxyLink's own records, a caller cannot supply it,
 // which is the one thing a scammer running our script cannot forge.
 func apiWho(server, code string) (*whoResponse, error) {
 	resp, err := apiClient.Get(fmt.Sprintf("%s/api/support/%s/who", server, url.PathEscape(code)))
@@ -1369,13 +1369,13 @@ func apiEnd(server, code string) {
 // and SYSTEM. Go's file modes do not map to Windows ACLs, so 0600 on a file under
 // C:\Windows\Temp bought nothing: any signed-in user could read the WireGuard private key,
 // or pre-create the installer path for us to truncate and then execute as Administrator.
-// ⚠️ AN ACL IS NOT ENOUGH — THE OWNER HAS TO BE TAKEN TOO.
+// ⚠️ AN ACL IS NOT ENOUGH. THE OWNER HAS TO BE TAKEN TOO.
 //
 // C:\ProgramData lets ordinary users create subfolders, and whoever creates one OWNS it. A
 // Windows object's owner keeps an implicit WRITE_DAC no matter what the DACL says, so a
 // standard user who pre-creates C:\ProgramData\ProxyLinkSupport before a session can hand
 // themselves back full control the instant after our icacls runs, and then swap the
-// hash-verified installer for their own in the gap between the check and the exec — which we
+// hash-verified installer for their own in the gap between the check and the exec, which we
 // perform as Administrator. Moving off C:\Windows\Temp only closed the file version of that
 // hole; pre-creating the DIRECTORY walked straight back in. So: refuse a reparse point, take
 // ownership, and only then set the DACL.
@@ -1495,7 +1495,7 @@ func psEscape(v string) string {
 }
 
 // waitFor blocks on wg, but never longer than d: a stuck installer must not leave the
-// customer staring at "cleaning up" forever. Reports whether the wait actually completed —
+// customer staring at "cleaning up" forever. Reports whether the wait actually completed:
 // a timeout means work is still running and cleanup cannot claim the machine is clean.
 func waitFor(wg *sync.WaitGroup, d time.Duration) bool {
 	done := make(chan struct{})
@@ -1513,7 +1513,7 @@ func runHidden(name string, args ...string) (string, error) {
 }
 
 // runHiddenFor runs a command with a hard time limit. Every external command here can hang
-// — a wedged installer, a service that never answers — and without a limit the hang becomes
+// a wedged installer, a service that never answers, and without a limit the hang becomes
 // the UI's, with both controls disabled and End Task the only way out.
 func runHiddenFor(d time.Duration, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
