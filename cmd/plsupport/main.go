@@ -1150,8 +1150,8 @@ func recoverPreviousSession() {
 	// elevated launch believe it installed the customer's own UltraVNC, and silently run
 	// their uninstaller and force-delete the folder. The evidence is forgeable, so it does
 	// not get a vote: a legacy marker means "undo OUR changes", never "remove software".
-	// This is the CLAUDE.md rule for unknown ownership — it restrains what we DELETE and
-	// never what we maintain. The cost is an idle UltraVNC left installed after a v4 crash;
+	// This is the rule we apply whenever ownership is unknown: it restrains what we DELETE
+	// and never what we maintain. The cost is an idle UltraVNC left installed after a v4 crash;
 	// the alternative cost is deleting a stranger's software on a forged file.
 	if legacy {
 		preexisting = true
