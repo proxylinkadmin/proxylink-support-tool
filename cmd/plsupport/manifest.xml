@@ -14,6 +14,20 @@
       </requestedPrivileges>
     </security>
   </trustInfo>
+  <!-- DPI AWARENESS. Without this Windows treats the process as DPI-unaware and
+       BITMAP-STRETCHES the whole window on any display scaled above 100% - which
+       is most laptops (125%/150%) and every 4K monitor. That is why the text
+       looked blurry: it was not being rendered at the display's resolution, it
+       was being rendered at 96 DPI and then blown up. PerMonitorV2 also keeps it
+       sharp when the window is dragged between monitors with different scaling.
+       `true` is the fallback for older Windows that ignores the 2016 key. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
       <!-- Windows 10 and later -->
