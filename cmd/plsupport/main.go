@@ -250,6 +250,20 @@ func runGUI() {
 		return
 	}
 
+	// Under the Windows 11 visual style a FOCUSED Edit paints its bottom border in
+	// the SYSTEM ACCENT colour -- blue on a default install, and whatever the user
+	// has picked otherwise. Nothing in the app chose that colour and nothing in the
+	// app can theme it away, because Windows draws it.
+	//
+	// Dropping the visual style on this ONE control stops Windows theming it at all,
+	// so the field keeps the background and text we set and gains no accent
+	// underline. Empty strings mean "no theme" (nil would mean "back to default").
+	// Scoped to the code field: every other widget keeps its native look.
+	if codeEdit != nil {
+		empty, _ := windows.UTF16PtrFromString("")
+		win.SetWindowTheme(win.HWND(codeEdit.Handle()), empty, empty)
+	}
+
 	// Closing the window ends the session. Cleanup (stop VNC, uninstall, drop the tunnel) takes
 	// a few seconds, so it runs on a background goroutine with a visible status: cancel the
 	// first close, clean up, then close for real when it finishes, keeping the window responsive.
