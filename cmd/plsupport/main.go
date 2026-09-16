@@ -232,18 +232,18 @@ func runGUI() {
 		MinSize:    dcl.Size{Width: 480, Height: 320},
 		Size:       dcl.Size{Width: 480, Height: 320},
 		Layout:     dcl.VBox{Margins: dcl.Margins{Left: 24, Top: 20, Right: 24, Bottom: 20}, Spacing: 8},
-		Background: dcl.SolidColorBrush{Color: walk.RGB(255, 255, 255)},
+		Background: dcl.SolidColorBrush{Color: walk.RGB(250, 250, 251)},
 		Children: []dcl.Widget{
 			dcl.ImageView{Image: logoBmp, Mode: dcl.ImageViewModeZoom, MinSize: dcl.Size{Width: 56, Height: 56}, MaxSize: dcl.Size{Width: 56, Height: 56}},
-			dcl.Label{Text: "ProxyLink Support", Font: dcl.Font{Family: "Segoe UI", PointSize: 16, Bold: true}, TextColor: walk.RGB(15, 118, 110)},
-			dcl.Label{Text: "Secure one-time remote support", TextColor: walk.RGB(90, 90, 90)},
+			dcl.Label{Text: "ProxyLink Support", Font: dcl.Font{Family: "Segoe UI", PointSize: 16, Bold: true}, TextColor: walk.RGB(201, 138, 46)},
+			dcl.Label{Text: "Secure one-time remote support", TextColor: walk.RGB(74, 87, 104)},
 			dcl.VSpacer{Size: 8},
 			dcl.Label{Text: "Enter the code your technician gave you:"},
 			dcl.LineEdit{AssignTo: &codeEdit, MaxLength: 8, Text: preCode, Font: dcl.Font{Family: "Consolas", PointSize: 13}},
 			dcl.PushButton{AssignTo: &connectBtn, Text: "Connect", OnClicked: onConnect, MinSize: dcl.Size{Height: 34}},
 			dcl.VSpacer{Size: 8},
-			dcl.Label{AssignTo: &statusLabel, Text: "", Font: dcl.Font{Family: "Segoe UI", PointSize: 10, Bold: true}, TextColor: walk.RGB(15, 118, 110)},
-			dcl.Label{AssignTo: &detailLabel, Text: "You can close this window at any time to end support.", TextColor: walk.RGB(120, 120, 120)},
+			dcl.Label{AssignTo: &statusLabel, Text: "", Font: dcl.Font{Family: "Segoe UI", PointSize: 10, Bold: true}, TextColor: walk.RGB(201, 138, 46)},
+			dcl.Label{AssignTo: &detailLabel, Text: "You can close this window at any time to end support.", TextColor: walk.RGB(122, 132, 146)},
 		},
 	}).Create(); err != nil {
 		return
