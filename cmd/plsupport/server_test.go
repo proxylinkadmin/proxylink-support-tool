@@ -1,5 +1,7 @@
 package main
 
+import "net"
+
 import "testing"
 
 // The -server= flag chooses which server tells the customer WHO is asking to connect, where
@@ -69,5 +71,50 @@ func TestAllowedServerRejectsEverythingButOurHosts(t *testing.T) {
 		if got != want {
 			t.Errorf("allowedServer(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// ── VNC port selection ────────────────────────────────────────────────────────
+//
+// 2026-09-23: a customer's PC already ran TightVNC on 5900, so our UltraVNC never got the
+// port. guacd connected to THEIR server, was refused, and the technician saw a blank screen.
+// We do not take the port from them - CLAUDE.md is explicit that a service predating us is
+// the customer's - so we step around it instead.
+
+func TestPickVncPortsPrefers5900WhenFree(t *testing.T) {
+	vnc, http := pickVncPorts(0)
+	if vnc != 5900 || http != 5800 {
+		t.Fatalf("with nothing in the way we must not move: got %d/%d, want 5900/5800", vnc, http)
+	}
+}
+
+func TestPickVncPortsStepsAroundAnOccupiedPort(t *testing.T) {
+	// Stand in for the customer's TightVNC.
+	squatter, err := net.Listen("tcp", "127.0.0.1:5900")
+	if err != nil {
+		t.Skip("5900 already in use on this machine; cannot run the occupied-port case")
+	}
+	defer squatter.Close()
+
+	vnc, http := pickVncPorts(0)
+	if vnc == 5900 {
+		t.Fatal("chose 5900 while something else was holding it")
+	}
+	if vnc < 5901 || vnc > 5919 {
+		t.Fatalf("chose %d, outside the 5901-5919 range", vnc)
+	}
+	// The HTTP port must move WITH it. The machine that collides on 5900 is a good bet to
+	// collide on 5800 too, and a winvnc that cannot bind its HTTP port loses the session.
+	if http != vnc-100 {
+		t.Fatalf("http port %d did not follow vnc port %d", http, vnc)
+	}
+}
+
+func TestPickVncPortsReusesThePortWeAlreadyToldTheServer(t *testing.T) {
+	// A mid-session restart must rebind the same port: /ready only accepts an update while
+	// the session is pending, so drifting would strand the technician on a stale port.
+	vnc, _ := pickVncPorts(5907)
+	if vnc != 5907 {
+		t.Fatalf("did not prefer the remembered port: got %d, want 5907", vnc)
 	}
 }

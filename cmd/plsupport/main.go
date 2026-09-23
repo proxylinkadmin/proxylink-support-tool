@@ -133,6 +133,10 @@ type persistedState struct {
 	WgWasInstalled  bool   `json:"wg_was_installed"`
 	UvncDir         string `json:"uvnc_dir"`
 	UvncService     string `json:"uvnc_service"`
+	// The port our VNC server actually got. Remembered so a mid-session restart rebinds the
+	// SAME port: the server was told this one at /ready and only accepts an update while the
+	// session is still pending, so drifting to a different port would strand the technician.
+	VncPort int `json:"vnc_port,omitempty"`
 }
 
 type appState struct {
@@ -147,6 +151,7 @@ type appState struct {
 	wgWasInstalled  bool
 	uvncDir         string
 	uvncService     string
+	vncPort         int // 0 until chosen; see pickVncPorts
 
 	vncTouched bool // we have begun installing/configuring VNC this run
 	wgTouched  bool // we have begun installing/configuring the tunnel this run
@@ -171,6 +176,7 @@ func (s *appState) snapshot() persistedState {
 		WgWasInstalled:  s.wgWasInstalled,
 		UvncDir:         s.uvncDir,
 		UvncService:     s.uvncService,
+		VncPort:         s.vncPort,
 	}
 }
 
@@ -561,14 +567,20 @@ func runFlow(s *appState) {
 	time.Sleep(2 * time.Second)
 
 	setStatus("Preparing screen sharing...", "")
-	if err := setupUltraVnc(reg.VncPasswordIni, s); err != nil {
+	vncPort, err := setupUltraVnc(reg.VncPasswordIni, s)
+	if err != nil {
 		fail("screen sharing setup failed: " + err.Error())
 		return
 	}
-	addVncFirewallRule(s, reg.AllowedIPs)
+	// ⚠️ One value feeds all three places the port lives: the ini above, the firewall rule
+	// here, and the server at /ready below. They were three literals before, 220 lines apart.
+	// Moving one and forgetting another drops the connection at the firewall, which surfaces
+	// as a timeout and reads as "ask them to open the tool again" — confidently wrong, and
+	// pointing away from the real cause.
+	addVncFirewallRule(s, reg.AllowedIPs, vncPort)
 
 	setStatus("Notifying your technician...", "")
-	if err := apiReady(s.server, s.code); err != nil {
+	if err := apiReady(s.server, s.code, vncPort); err != nil {
 		fail("could not notify technician")
 		return
 	}
@@ -704,7 +716,7 @@ func iniPaths(dir string) []string {
 	}
 }
 
-func setupUltraVnc(passwdIni string, s *appState) error {
+func setupUltraVnc(passwdIni string, s *appState) (int, error) {
 	// ⚠️ Before the first byte changes, not after this function returns successfully.
 	// Everything below modifies the machine; an error return with the flag unset told
 	// cleanup there was nothing to undo, and the state file was then deleted, making the
@@ -719,25 +731,25 @@ func setupUltraVnc(passwdIni string, s *appState) error {
 		snapshotFirewallRules()
 		setStatus("Downloading screen sharing (~5 MB)...", "")
 		if err := download(ultravncInstaller, vncSetupPath); err != nil {
-			return fmt.Errorf("download: %w", err)
+			return 0, fmt.Errorf("download: %w", err)
 		}
 		// We are about to run this as Administrator. Verify the bytes are the ones we
 		// published before executing them.
 		if err := verifySHA256(vncSetupPath, ultravncInstallerSHA256); err != nil {
 			os.Remove(vncSetupPath)
-			return err
+			return 0, err
 		}
 		setStatus("Installing screen sharing...", "")
 		// uvnc-bvba ships an Inno Setup installer.
 		if out, err := runHiddenFor(5*time.Minute, vncSetupPath, "/verysilent", "/suppressmsgboxes", "/norestart"); err != nil {
-			return fmt.Errorf("install: %v %s", err, out)
+			return 0, fmt.Errorf("install: %v %s", err, out)
 		}
 		// wait for winvnc.exe to appear
 		for i := 0; i < 30 && !uvncInstalled(); i++ {
 			time.Sleep(1 * time.Second)
 		}
 		if !uvncInstalled() {
-			return fmt.Errorf("UltraVNC did not appear after install")
+			return 0, fmt.Errorf("UltraVNC did not appear after install")
 		}
 		// The install decided the real paths; re-resolve now that they exist.
 		dir = uvncDir()
@@ -752,17 +764,35 @@ func setupUltraVnc(passwdIni string, s *appState) error {
 	// point we write the password and start the service; doing that after teardown has run
 	// leaves exactly what teardown existed to remove.
 	if s.isCleaning() {
-		return fmt.Errorf("session ended during setup")
+		return 0, fmt.Errorf("session ended during setup")
 	}
 
-	// Stop anything holding port 5900 before rewriting config.
+	// Stop OUR UltraVNC (only ours — see stopUvnc) before rewriting its config.
+	//
+	// ⚠️ The comment here used to read "Stop anything holding port 5900", which stopUvnc has
+	// never done and must never do. That gap between comment and code is exactly why a
+	// customer's TightVNC sitting on 5900 went unnoticed: the line promised a guarantee
+	// nobody had implemented, so nobody checked.
 	stopUvnc(dir, service)
+
+	// Now that ours is out of the way, find out what is actually free.
+	vncPort, httpPort := pickVncPorts(s.snapshot().VncPort)
+	s.mu.Lock()
+	s.vncPort = vncPort
+	s.mu.Unlock()
+	writeState(s)
+	if vncPort != 5900 {
+		setStatus(fmt.Sprintf("Another screen-sharing program is using the usual port; using %d instead...", vncPort), "")
+	}
 
 	ini := "[ultravnc]\r\n" +
 		"passwd=" + passwdIni + "\r\n" +
 		"passwd2=" + passwdIni + "\r\n" +
-		"PortNumber=5900\r\n" +
-		"HTTPPortNumber=5800\r\n" +
+		fmt.Sprintf("PortNumber=%d\r\n", vncPort) +
+		fmt.Sprintf("HTTPPortNumber=%d\r\n", httpPort) +
+		// The Java web viewer is dead weight in our flow — guacd speaks RFB straight to the
+		// port above — and it is a second way to collide with an existing VNC server.
+		"HTTPConnect=0\r\n" +
 		"AutoPortSelect=0\r\n" +
 		"UseVncAuthentication=1\r\n" +
 		"AuthRequired=1\r\n" +
@@ -792,7 +822,7 @@ func setupUltraVnc(passwdIni string, s *appState) error {
 		// session password back rather than their settings.
 		if fileExists(iniPath) && !fileExists(iniPath+".plbak") {
 			if err := copyFile(iniPath, iniPath+".plbak"); err != nil && iniPath == primary {
-				return fmt.Errorf("back up ini: %w", err)
+				return 0, fmt.Errorf("back up ini: %w", err)
 			}
 		}
 		// If the config directory is not there we are creating it, so it is ours to own and
@@ -806,14 +836,14 @@ func setupUltraVnc(passwdIni string, s *appState) error {
 		// Remove first, then create exclusively: the same hardening download() uses, so we
 		// never write our password through a file or link somebody else left at this path.
 		if err := writeFileExclusive(iniPath, []byte(ini)); err != nil && iniPath == primary {
-			return fmt.Errorf("write ini: %w", err)
+			return 0, fmt.Errorf("write ini: %w", err)
 		}
 		lockDownPath(iniPath, false)
 	}
 
 	// Install (if needed) and start the service.
 	if s.isCleaning() {
-		return fmt.Errorf("session ended during setup")
+		return 0, fmt.Errorf("session ended during setup")
 	}
 	runHidden(filepath.Join(dir, "winvnc.exe"), "-install")
 	if service == "" {
@@ -826,11 +856,47 @@ func setupUltraVnc(passwdIni string, s *appState) error {
 	for i := 0; i < 10; i++ {
 		out, _ := runHidden(`C:\Windows\System32\sc.exe`, "query", service)
 		if strings.Contains(out, "RUNNING") {
-			return nil
+			break // reaching RUNNING is encouraging, not proof — verified below
 		}
 		time.Sleep(1 * time.Second)
 	}
-	return nil // service state best-effort; guacd will retry
+	// ⭐ Do not report success on the strength of the loop above: it is best-effort and falls
+	// through even when the service never reached RUNNING. Ask Windows who owns the socket.
+	for i := 0; i < 8; i++ {
+		if vncPortIsOurs(vncPort, dir) {
+			return vncPort, nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return vncPort, fmt.Errorf("screen sharing did not start on port %d", vncPort)
+}
+
+// vncPortIsOurs proves the listener on this port is the winvnc we just started, by asking
+// Windows which process owns the socket and checking it runs from our install folder.
+//
+// ⭐ This exists because every other signal lies. The service-start loop below is explicitly
+// best-effort and returns nil even when the service never reached RUNNING, so "setup
+// succeeded" is not evidence. An RFB banner is not evidence either: the whole incident this
+// fixes was guacd getting a perfectly good banner from somebody else's VNC server. Only the
+// owning process answers the question actually being asked.
+func vncPortIsOurs(port int, dir string) bool {
+	if dir == "" {
+		return false
+	}
+	out, _ := runPowerShell(fmt.Sprintf(
+		`$c = Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; `+
+			`if ($c) { (Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue).Path } `+
+			`else { `+
+			// Server 2012 R2 and older have no Get-NetTCPConnection; fall back to netstat.
+			`  $line = (netstat -ano | Select-String ":%d\s" | Select-String "LISTENING" | Select-Object -First 1); `+
+			`  if ($line) { $pid2 = ($line.ToString() -split '\s+')[-1]; (Get-Process -Id $pid2 -ErrorAction SilentlyContinue).Path } }`,
+		port, port))
+
+	owner := strings.TrimSpace(out)
+	if owner == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(owner), strings.ToLower(dir))
 }
 
 // stopUvnc stops the VNC service and kills only the winvnc processes running out of the
@@ -925,7 +991,7 @@ func uninstallUltraVncSilently(dir string) {
 	os.Remove(legacyVncSetupPath)
 }
 
-func addVncFirewallRule(s *appState, allowedIPs string) {
+func addVncFirewallRule(s *appState, allowedIPs string, port int) {
 	snap := s.snapshot()
 
 	// ⚠️ Only sweep when WE installed UltraVNC, and only rules that belong to the copy we
@@ -981,7 +1047,7 @@ func addVncFirewallRule(s *appState, allowedIPs string) {
 	}
 	runHidden(`C:\Windows\System32\netsh.exe`, "advfirewall", "firewall", "delete", "rule", "name="+firewallRuleName)
 	runHidden(`C:\Windows\System32\netsh.exe`, "advfirewall", "firewall", "add", "rule",
-		"name="+firewallRuleName, "protocol=TCP", "dir=in", "localport=5900",
+		"name="+firewallRuleName, "protocol=TCP", "dir=in", fmt.Sprintf("localport=%d", port),
 		"remoteip="+remote, "action=allow", "profile=any")
 }
 
@@ -1342,8 +1408,14 @@ func apiRegister(server, code, pubKey string) (*registerResponse, error) {
 	return &r, nil
 }
 
-func apiReady(server, code string) error {
-	resp, err := apiClient.Post(fmt.Sprintf("%s/api/support/%s/ready", server, url.PathEscape(code)), "application/json", bytes.NewReader([]byte("{}")))
+func apiReady(server, code string, vncPort int) error {
+	// The server defaults to 5900 when we send nothing, so an older build is unaffected; it
+	// only needs telling when our port is not the one it would assume.
+	body := []byte("{}")
+	if vncPort > 0 {
+		body = []byte(fmt.Sprintf(`{"vnc_port":%d}`, vncPort))
+	}
+	resp, err := apiClient.Post(fmt.Sprintf("%s/api/support/%s/ready", server, url.PathEscape(code)), "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
