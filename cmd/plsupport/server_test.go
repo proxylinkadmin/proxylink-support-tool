@@ -82,7 +82,7 @@ func TestAllowedServerRejectsEverythingButOurHosts(t *testing.T) {
 // the customer's - so we step around it instead.
 
 func TestPickVncPortsPrefers5900WhenFree(t *testing.T) {
-	vnc, http := pickVncPorts(0)
+	vnc, http, _ := pickVncPorts(0)
 	if vnc != 5900 || http != 5800 {
 		t.Fatalf("with nothing in the way we must not move: got %d/%d, want 5900/5800", vnc, http)
 	}
@@ -96,7 +96,7 @@ func TestPickVncPortsStepsAroundAnOccupiedPort(t *testing.T) {
 	}
 	defer squatter.Close()
 
-	vnc, http := pickVncPorts(0)
+	vnc, http, _ := pickVncPorts(0)
 	if vnc == 5900 {
 		t.Fatal("chose 5900 while something else was holding it")
 	}
@@ -113,7 +113,7 @@ func TestPickVncPortsStepsAroundAnOccupiedPort(t *testing.T) {
 func TestPickVncPortsReusesThePortWeAlreadyToldTheServer(t *testing.T) {
 	// A mid-session restart must rebind the same port: /ready only accepts an update while
 	// the session is pending, so drifting would strand the technician on a stale port.
-	vnc, _ := pickVncPorts(5907)
+	vnc, _, _ := pickVncPorts(5907)
 	if vnc != 5907 {
 		t.Fatalf("did not prefer the remembered port: got %d, want 5907", vnc)
 	}
@@ -127,7 +127,7 @@ func TestPickVncPortsReusesThePortWeAlreadyToldTheServer(t *testing.T) {
 func TestPickVncPortsRefusesAPortTheOsSaysIsListening(t *testing.T) {
 	defer stubListeners(t, map[int]bool{5900: true})()
 
-	vnc, http := pickVncPorts(0)
+	vnc, http, _ := pickVncPorts(0)
 	if vnc != 5901 || http != 5801 {
 		t.Fatalf("a port with a live listener was handed out: got %d/%d, want 5901/5801", vnc, http)
 	}
@@ -138,7 +138,7 @@ func TestPickVncPortsRefusesAPortTheOsSaysIsListening(t *testing.T) {
 func TestPickVncPortsStepsPastAnOccupiedHttpPortToo(t *testing.T) {
 	defer stubListeners(t, map[int]bool{5800: true})()
 
-	vnc, http := pickVncPorts(0)
+	vnc, http, _ := pickVncPorts(0)
 	if vnc != 5901 || http != 5801 {
 		t.Fatalf("stepped onto an occupied HTTP port: got %d/%d, want 5901/5801", vnc, http)
 	}
@@ -149,7 +149,7 @@ func TestPickVncPortsStepsPastAnOccupiedHttpPortToo(t *testing.T) {
 func TestPickVncPortsStillWorksWhenTheOsCannotBeAsked(t *testing.T) {
 	defer stubListeners(t, nil)()
 
-	if vnc, http := pickVncPorts(0); vnc != 5900 || http != 5800 {
+	if vnc, http, _ := pickVncPorts(0); vnc != 5900 || http != 5800 {
 		t.Fatalf("got %d/%d, want the default 5900/5800", vnc, http)
 	}
 }
@@ -173,4 +173,28 @@ func stubListeners(t *testing.T, ports map[int]bool) func() {
 	prev := platformListeners
 	platformListeners = func() map[int]bool { return ports }
 	return func() { platformListeners = prev }
+}
+
+// The status line may only blame 5900 when 5900 was actually tested and found busy. A
+// remembered port is tried first, so we can land on 5903 with 5900 perfectly free — and
+// telling the customer "port 5900 is already in use" would then be a cause we never observed.
+func TestPickVncPortsDoesNotBlame5900WhenItWasNeverBusy(t *testing.T) {
+	defer stubListeners(t, map[int]bool{})()
+
+	vnc, _, defaultBusy := pickVncPorts(5907)
+	if vnc != 5907 {
+		t.Fatalf("did not reuse the remembered port: got %d", vnc)
+	}
+	if defaultBusy {
+		t.Fatal("claimed 5900 was in use when nothing was listening on it")
+	}
+}
+
+func TestPickVncPortsReportsTheDefaultBusyWhenItIs(t *testing.T) {
+	defer stubListeners(t, map[int]bool{5900: true})()
+
+	vnc, _, defaultBusy := pickVncPorts(0)
+	if vnc != 5901 || !defaultBusy {
+		t.Fatalf("got port %d defaultBusy=%v, want 5901 / true", vnc, defaultBusy)
+	}
 }

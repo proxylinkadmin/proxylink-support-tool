@@ -777,13 +777,21 @@ func setupUltraVnc(passwdIni string, s *appState) (int, error) {
 	stopUvnc(dir, service)
 
 	// Now that ours is out of the way, find out what is actually free.
-	vncPort, httpPort := pickVncPorts(s.snapshot().VncPort)
+	vncPort, httpPort, defaultBusy := pickVncPorts(s.snapshot().VncPort)
 	s.mu.Lock()
 	s.vncPort = vncPort
 	s.mu.Unlock()
 	writeState(s)
-	if vncPort != 5900 {
-		setStatus(fmt.Sprintf("Another screen-sharing program is using the usual port; using %d instead...", vncPort), "")
+	// Name BOTH ports, with distinct roles. The first version of this line read "using the
+	// usual port; using 5901 instead" — two "using" clauses around a single number, which the
+	// first person to see it in the wild read as "5901 was occupied". A status line that has
+	// to be decoded is worse than no status line.
+	if defaultBusy {
+		setStatus(
+			fmt.Sprintf("Port 5900 is already in use on this PC, so screen sharing will use port %d instead...", vncPort),
+			"Another screen-sharing program is running here. It is being left exactly as it is.")
+	} else if vncPort != 5900 {
+		setStatus(fmt.Sprintf("Setting up screen sharing on port %d...", vncPort), "")
 	}
 
 	ini := "[ultravnc]\r\n" +

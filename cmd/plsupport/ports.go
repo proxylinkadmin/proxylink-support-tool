@@ -63,13 +63,19 @@ func portFreeWith(port int, listening map[int]bool) bool {
 // The HTTP port moves with it. UltraVNC's Java viewer defaults to 5800, and the very machine
 // that collides on 5900 is a good bet to collide on 5800 as well; a winvnc that cannot bind
 // its HTTP port is a needless way to lose the session.
-func pickVncPorts(preferred int) (vncPort, httpPort int) {
+// defaultBusy reports whether 5900 itself was unavailable, and exists so the message shown to
+// the customer can only say "5900 is in use" when we actually looked. A remembered port is
+// tried FIRST, so we can land on 5903 without ever testing 5900 — asserting a cause we never
+// observed is how a status line ends up lying to the person reading it.
+func pickVncPorts(preferred int) (vncPort, httpPort int, defaultBusy bool) {
 	// One snapshot of the listener table for the whole scan — 20 PowerShell round trips while
 	// the user watches a "Preparing screen sharing" spinner is not worth the precision.
 	var listening map[int]bool
 	if platformListeners != nil {
 		listening = platformListeners()
 	}
+
+	defaultBusy = !(portFreeWith(5900, listening) && portFreeWith(5800, listening))
 
 	candidates := make([]int, 0, 21)
 	if preferred >= 5900 && preferred <= 5919 {
@@ -82,10 +88,10 @@ func pickVncPorts(preferred int) (vncPort, httpPort int) {
 	}
 	for _, p := range candidates {
 		if portFreeWith(p, listening) && portFreeWith(p-100, listening) {
-			return p, p - 100
+			return p, p - 100, defaultBusy
 		}
 	}
 	// Nothing free in range. Return the default and let the verification step fail loudly
 	// rather than reporting a port we have no reason to believe in.
-	return 5900, 5800
+	return 5900, 5800, defaultBusy
 }
