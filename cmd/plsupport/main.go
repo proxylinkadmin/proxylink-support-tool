@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -879,6 +880,43 @@ func setupUltraVnc(passwdIni string, s *appState) (int, error) {
 // succeeded" is not evidence. An RFB banner is not evidence either: the whole incident this
 // fixes was guacd getting a perfectly good banner from somebody else's VNC server. Only the
 // owning process answers the question actually being asked.
+// init wires the platform-specific half of the port probe. portFree lives in ports.go with no
+// build constraint so it stays testable; asking Windows for its listener table cannot.
+func init() {
+	platformListeners = windowsListeningPorts
+}
+
+// windowsListeningPorts returns every TCP port Windows reports a listener on.
+//
+// This is the authoritative answer to "is that port in use", and the reason it exists: a bind
+// test is NOT that answer on Windows. A process holding 0.0.0.0:N leaves 127.0.0.1:N bindable,
+// so a bind probe calls an occupied port free — which is how a machine running TightVNC on
+// 5900 got winvnc pointed at 5900 (2026-09-23). Returns nil when we cannot ask, and nil means
+// "no information", never "nothing is listening": the caller falls back to the other probes.
+func windowsListeningPorts() map[int]bool {
+	out, err := runPowerShell(
+		`$p = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | ` +
+			`Select-Object -ExpandProperty LocalPort; ` +
+			`if ($p) { $p } else { ` +
+			// Server 2012 R2 and older have no Get-NetTCPConnection; fall back to netstat.
+			`  netstat -ano | Select-String "LISTENING" | ForEach-Object { ` +
+			`    (($_.ToString() -split '\s+') | Where-Object { $_ })[1] -replace '.*:','' } }`)
+	if err != nil {
+		return nil
+	}
+
+	ports := map[int]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		if n, convErr := strconv.Atoi(strings.TrimSpace(line)); convErr == nil && n > 0 && n <= 65535 {
+			ports[n] = true
+		}
+	}
+	if len(ports) == 0 {
+		return nil // an empty table means the query failed, not that the machine has no listeners
+	}
+	return ports
+}
+
 func vncPortIsOurs(port int, dir string) bool {
 	if dir == "" {
 		return false

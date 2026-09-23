@@ -118,3 +118,59 @@ func TestPickVncPortsReusesThePortWeAlreadyToldTheServer(t *testing.T) {
 		t.Fatalf("did not prefer the remembered port: got %d, want 5907", vnc)
 	}
 }
+
+// The bug this file exists for: on 2026-09-23 a machine running TightVNC on 5900 got winvnc
+// pointed at 5900 anyway. portFree was a BIND test, and on Windows a process holding
+// 0.0.0.0:5900 leaves 127.0.0.1:5900 bindable — so the probe said "free" about a port that was
+// actively serving. The fix is to ask the OS what is listening. This test is that question:
+// the port is bindable here (nothing in this process holds it) and must still be refused.
+func TestPickVncPortsRefusesAPortTheOsSaysIsListening(t *testing.T) {
+	defer stubListeners(t, map[int]bool{5900: true})()
+
+	vnc, http := pickVncPorts(0)
+	if vnc != 5901 || http != 5801 {
+		t.Fatalf("a port with a live listener was handed out: got %d/%d, want 5901/5801", vnc, http)
+	}
+}
+
+// The HTTP port has to move with it. A machine that collides on 5900 is a good bet to collide
+// on 5800, and winvnc failing to bind its HTTP port loses the session just as thoroughly.
+func TestPickVncPortsStepsPastAnOccupiedHttpPortToo(t *testing.T) {
+	defer stubListeners(t, map[int]bool{5800: true})()
+
+	vnc, http := pickVncPorts(0)
+	if vnc != 5901 || http != 5801 {
+		t.Fatalf("stepped onto an occupied HTTP port: got %d/%d, want 5901/5801", vnc, http)
+	}
+}
+
+// A machine we cannot interrogate must not be treated as an empty machine. When the listener
+// query fails it returns nil, and nil means "no information" — the remaining probes decide.
+func TestPickVncPortsStillWorksWhenTheOsCannotBeAsked(t *testing.T) {
+	defer stubListeners(t, nil)()
+
+	if vnc, http := pickVncPorts(0); vnc != 5900 || http != 5800 {
+		t.Fatalf("got %d/%d, want the default 5900/5800", vnc, http)
+	}
+}
+
+// Anything that ANSWERS a connection is occupied, whatever the table says.
+func TestPortFreeRefusesAPortThatAnswers(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot listen here: %v", err)
+	}
+	defer l.Close()
+
+	port := l.Addr().(*net.TCPAddr).Port
+	if portFree(port) {
+		t.Fatalf("port %d has a live listener and was reported free", port)
+	}
+}
+
+func stubListeners(t *testing.T, ports map[int]bool) func() {
+	t.Helper()
+	prev := platformListeners
+	platformListeners = func() map[int]bool { return ports }
+	return func() { platformListeners = prev }
+}

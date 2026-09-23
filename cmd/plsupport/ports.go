@@ -9,14 +9,41 @@ package main
 import (
 	"fmt"
 	"net"
+	"time"
 )
 
-// portFree reports whether we can bind this TCP port right now.
+// platformListeners returns the TCP ports the OS says are being listened on, or nil when we
+// cannot ask. Set from main.go on Windows; nil elsewhere (and in tests, which set it directly).
+var platformListeners func() map[int]bool
+
+// portFree reports whether this TCP port looks genuinely unused.
 //
-// ⚠️ This is a point-in-time answer, not a reservation — something else can take the port
-// between here and winvnc starting. That is why the caller VERIFIES afterwards (see
-// vncPortIsOurs) instead of trusting this. Judge it by what it produced, not by what it said.
+// ⚠️ It asks THREE questions, because the obvious one is the wrong one. A plain
+// net.Listen("127.0.0.1:N") answers "can I bind this?", and on Windows that is NOT the same as
+// "is anything serving here?": a process holding 0.0.0.0:N without SO_EXCLUSIVEADDRUSE leaves
+// the more specific 127.0.0.1:N bindable, so the bind succeeds and the port looks free. That
+// is exactly how we handed 5900 to winvnc on a machine where TightVNC was already serving it
+// (2026-09-23) — the probe was confident and wrong. So:
+//
+//  1. does the OS list a listener on it?   (authoritative, Windows only)
+//  2. does anything ANSWER a connection?   (catches a server we cannot see in the table)
+//  3. can we actually bind it?             (catches a reservation with nothing serving yet)
+//
+// Still a point-in-time answer, not a reservation — something can take the port between here
+// and winvnc starting. That is why the caller VERIFIES afterwards (vncPortIsOurs) instead of
+// trusting this. Judge it by what it produced, not by what it said.
 func portFree(port int) bool {
+	return portFreeWith(port, nil)
+}
+
+func portFreeWith(port int, listening map[int]bool) bool {
+	if listening != nil && listening[port] {
+		return false
+	}
+	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 400*time.Millisecond); err == nil {
+		c.Close()
+		return false
+	}
 	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return false
@@ -37,6 +64,13 @@ func portFree(port int) bool {
 // that collides on 5900 is a good bet to collide on 5800 as well; a winvnc that cannot bind
 // its HTTP port is a needless way to lose the session.
 func pickVncPorts(preferred int) (vncPort, httpPort int) {
+	// One snapshot of the listener table for the whole scan — 20 PowerShell round trips while
+	// the user watches a "Preparing screen sharing" spinner is not worth the precision.
+	var listening map[int]bool
+	if platformListeners != nil {
+		listening = platformListeners()
+	}
+
 	candidates := make([]int, 0, 21)
 	if preferred >= 5900 && preferred <= 5919 {
 		candidates = append(candidates, preferred) // a restart reuses what the server was told
@@ -47,7 +81,7 @@ func pickVncPorts(preferred int) (vncPort, httpPort int) {
 		}
 	}
 	for _, p := range candidates {
-		if portFree(p) && portFree(p-100) {
+		if portFreeWith(p, listening) && portFreeWith(p-100, listening) {
 			return p, p - 100
 		}
 	}
